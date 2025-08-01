@@ -11,20 +11,3 @@ Once the firmware is uploaded, the ESP32-C6 will begin scanning the connected DS
 
 ## License
 This project is licensed under the MIT License. Property of ILU.
-
-## Estructure
-├── CMakeLists.txt
-├── components
-│   ├── ds2431
-│   │   ├── CMakeLists.txt
-│   │   ├── ds2431.c
-│       └── ds2431.h
-│   └── ds2482
-│       ├── CMakeLists.txt
-│       ├── ds2482.c
-│       └── ds2482.h
-├── main
-│   ├── CMakeLists.txt
-│   └── main.c
-└── README.md                  This is the file you are currently reading
-
