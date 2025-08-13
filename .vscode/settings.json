@@ -1,27 +1,33 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
-  "idf.espIdfPathWin": "c:\\ESP32VSCode\\Espressif\\frameworks\\esp-idf-v5.4.1",
-  "idf.pythonInstallPath": "c:\\ESP32VSCode\\Espressif\\tools\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.espIdfPathWin": "C:\\Users\\sawer\\esp\\v5.5\\esp-idf",
+  "idf.pythonInstallPath": "c:\\Users\\sawer\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
   "idf.espAdfPathWin": "C:\\Users\\echivalan\\.espressif\\esp-adf",
   "idf.espMdfPathWin": "C:\\Users\\echivalan\\.espressif\\esp-mdf",
   "idf.openOcdConfigs": [
     "board/esp32c6-ftdi.cfg"
   ],
   "idf.portWin": "COM8",
-  "idf.toolsPathWin": "c:\\ESP32VSCode\\Espressif\\tools",
+  "idf.toolsPathWin": "c:\\Users\\sawer\\.espressif",
   "idf.customExtraVars": {
+    "OPENOCD_SCRIPTS": "C:\\Users\\sawer\\.espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20230921/openocd-esp32/share/openocd/scripts",
+    "IDF_CCACHE_ENABLE": "1",
+    "ESP_ROM_ELF_DIR": "C:\\Users\\sawer\\.espressif\\tools\\esp-rom-elfs\\20230320/",
     "IDF_TARGET": "esp32c6"
   },
-  "clangd.path": "c:\\ESP32VSCode\\Espressif\\tools\\tools\\esp-clang\\esp-18.1.2_20240912\\esp-clang\\bin\\clangd.exe",
+  "clangd.path": "c:\\Users\\sawer\\.espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
     "--background-index",
-    "--query-driver=c:\\ESP32VSCode\\Espressif\\tools\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32-elf-gcc.exe",
-    "--compile-commands-dir=${workspaceFolder}\\build"
+    "--query-driver=c:\\Users\\sawer\\.espressif\\tools\\riscv32-esp-elf\\esp-14.2.0_20241119\\riscv32-esp-elf\\bin\\riscv32-esp-elf-gcc.exe",
+    "--compile-commands-dir=c:\\Desarollo\\IDJFirmware\\build"
   ],
   "files.associations": {
     "compare": "c",
     "cstdint": "c",
-    "format": "c"
+    "format": "c",
+    "wifi_component.h": "c",
+    "freertos.h": "c",
+    "i2c.h": "c"
   },
   "idf.flashType": "UART"
 }

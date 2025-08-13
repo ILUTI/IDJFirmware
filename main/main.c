@@ -1,7 +1,17 @@
 #include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+
+#include "nvs_component.h"
+#include "mqtt_component.h"
+#include "ble_component.h"
+#include "wifi_component.h"
+
+#include "driver/i2c.h"
 #include "ds2482.h"
 #include "ds2431.h"
-#include "driver/i2c.h"
+
 
 //Tabla para mapeo
 typedef struct {
@@ -36,8 +46,18 @@ const char* buscar_unidad_por_rom(uint64_t rom) {
 #define I2C_MASTER_FREQ_HZ 100000
 
 void app_main(void) {
+
+    //Initialize NVS
+    init_nvs_component();
+
+    //Initialize Wifi Station
+    wifi_init_sta();
+
+    //Initialize MQTT Client
+    mqtt_app_start();
+
     // Configuración de I2C
-        i2c_config_t conf = {
+    i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
         .scl_io_num = I2C_MASTER_SCL_IO,
@@ -45,6 +65,7 @@ void app_main(void) {
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
+    
     i2c_param_config(I2C_MASTER_NUM, &conf);
     i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
 
