@@ -1,14 +1,14 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
-  "idf.espIdfPathWin": "C:\\Users\\sawer\\esp\\v5.5\\esp-idf",
-  "idf.pythonInstallPath": "c:\\Users\\sawer\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.espIdfPathWin": "C:/ESP32VSCode/Espressif/frameworks/esp-idf-v5.5/",
+  "idf.pythonInstallPath": "C:\\ESP32VSCode\\Espressif\\tools\\idf-python\\3.11.2\\python.exe",
   "idf.espAdfPathWin": "C:\\Users\\echivalan\\.espressif\\esp-adf",
   "idf.espMdfPathWin": "C:\\Users\\echivalan\\.espressif\\esp-mdf",
   "idf.openOcdConfigs": [
     "board/esp32c6-ftdi.cfg"
   ],
   "idf.portWin": "COM8",
-  "idf.toolsPathWin": "c:\\Users\\sawer\\.espressif",
+  "idf.toolsPathWin": "C:\\ESP32VSCode\\Espressif",
   "idf.customExtraVars": {
     "OPENOCD_SCRIPTS": "C:\\Users\\sawer\\.espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20230921/openocd-esp32/share/openocd/scripts",
     "IDF_CCACHE_ENABLE": "1",

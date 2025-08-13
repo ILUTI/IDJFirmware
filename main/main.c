@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -12,6 +14,9 @@
 #include "ds2482.h"
 #include "ds2431.h"
 
+#include "cJSON.h"
+
+#define TAG "IDJ"
 
 //Tabla para mapeo
 typedef struct {
@@ -125,16 +130,37 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(5000)); // Espera 5 segundos antes de la siguiente iteración
     }
     */
-
+    
     //Mapeo de unidades y match con ROM's
     while(1){
         uint64_t roms[5];
         size_t found = 0;
         err = ds2482_search_rom_all(roms, 5, &found);
-        for (size_t i = 0; i < found; i++) {
-        const char *unidad = buscar_unidad_por_rom(roms[i]);
-        printf("Dispositivo %zu ROM: 0x%016llX - Unidad: %s\n", i + 1, roms[i], unidad);
+
+        cJSON *json = cJSON_CreateObject();
+
+        if (json == NULL) {
+            ESP_LOGE(TAG, "Failed to create JSON object");
+            continue;
         }
+
+        for (size_t i = 0; i < found; i++) {
+            char str[1];
+            char str_rom[18];
+
+            const char *unidad = buscar_unidad_por_rom(roms[i]);
+            sprintf(str_rom, "%016llX", roms[i]);
+            printf("Dispositivo %zu ROM: %s - Unidad: %s\n", i + 1, str_rom, unidad);
+            
+            cJSON_AddStringToObject(json, itoa(i, str, 10), str_rom);
+        }
+
+        // Convert the JSON object to a string.
+        char *json_string = cJSON_Print(json);
+        esp_mqtt_client_publish(mqtt_client, "GIO/IDJDATA/", json_string, 0, 0, 0);
+        free(json_string);
+        cJSON_Delete(json);
+        
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
