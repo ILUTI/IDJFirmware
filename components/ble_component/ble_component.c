@@ -156,7 +156,7 @@ static void handle_read_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *
            //Create DEVICE Unique ID, base of the MAC ADDR
             uint8_t mac[6];
             esp_read_mac(mac, ESP_MAC_WIFI_STA);
-            sprintf(value, "IDJ-%02X%02X", mac[4], mac[5]);
+            sprintf(value, "%s-%02X%02X", DEVICE_NAME, mac[4], mac[5]);
             rsp.attr_value.handle = param->read.handle;
             rsp.attr_value.len = sizeof(value);
             memcpy(rsp.attr_value.value, value, sizeof(value));
@@ -166,7 +166,7 @@ static void handle_read_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *
             ESP_LOGI(BLE_TAG,"READING WIFI SSID");
             err = read_str_nvs("wifi_ssid", value, sizeof(value));
             if (err != ESP_OK){
-                ESP_LOGE(BLE_TAG, "SOMETHING GO WORNG READING SSID FROM NVS");
+                ESP_LOGE(BLE_TAG, "SOMETHING GO WRONG READING SSID FROM NVS");
                 break;
             }
             rsp.attr_value.handle = param->read.handle;
@@ -178,7 +178,7 @@ static void handle_read_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *
             ESP_LOGI(BLE_TAG,"READING WIFI PASSWORD");
             err = read_str_nvs("wifi_pswd", value, sizeof(value));
             if (err != ESP_OK){
-                ESP_LOGE(BLE_TAG, "SOMETHING GO WORNG READING PASSWORD FROM NVS");
+                ESP_LOGE(BLE_TAG, "SOMETHING GO WRONG READING PASSWORD FROM NVS");
                 break;
             }
             rsp.attr_value.handle = param->read.handle;
@@ -278,7 +278,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 {
     switch (event) {
         case ESP_GATTS_REG_EVT:{
-            esp_err_t set_dev_name_ret = esp_ble_gap_set_device_name(SAMPLE_DEVICE_NAME);
+            esp_err_t set_dev_name_ret = esp_ble_gap_set_device_name(DEVICE_NAME);
             if (set_dev_name_ret){
                 ESP_LOGE(BLE_TAG, "set device name failed, error code = %x", set_dev_name_ret);
             }

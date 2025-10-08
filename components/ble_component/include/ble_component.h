@@ -27,7 +27,7 @@
 #define PROFILE_NUM                 1
 #define PROFILE_APP_IDX             0
 #define ESP_APP_ID                  0x55
-#define SAMPLE_DEVICE_NAME          "IDJ"
+#define DEVICE_NAME                 "GIO"
 #define SVC_INST_ID                 0
 
 #define GATTS_DEMO_CHAR_VAL_LEN_MAX 64
