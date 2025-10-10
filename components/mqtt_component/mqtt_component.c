@@ -36,13 +36,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         char topic[16];
         uint8_t mac[6];
         esp_read_mac(mac, ESP_MAC_WIFI_STA);
-        sprintf(topic, "GIO/IDJ-%02X%02X/+/", mac[4], mac[5]);
+        sprintf(topic, "GIO/%s-%02X%02X/+/", CONFIG_DEVICE_NAME, mac[4], mac[5]);
         //Subscribe to device topic
         esp_mqtt_client_subscribe(client,topic,0);
         if (! first_time){
             //This is the first time
             //Publish some message to received configurations
-            sprintf(topic, "GIO/IDJ-%02X%02X", mac[4], mac[5]);
+            sprintf(topic, "GIO/%s-%02X%02X", CONFIG_DEVICE_NAME, mac[4], mac[5]);
             cJSON *msg = cJSON_CreateObject();
             cJSON_AddBoolToObject(msg, "active", false);
             char *json_string = cJSON_Print(msg);

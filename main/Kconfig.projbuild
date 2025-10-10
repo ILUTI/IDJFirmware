@@ -1,0 +1,9 @@
+menu "Configuraciones Generales"
+
+config DEVICE_NAME
+    string "Device name"
+    default "GIO"
+    help
+      Base device name used to build BLE name and MQTT subscription and data channels.
+
+endmenu

@@ -17,6 +17,8 @@
 #include "esp_mac.h"
 #include "mqtt_client.h"
 
+#include "sdkconfig.h"
+
 #define MQTT_TAG "MQTT_COMPONENT"
 #define BROKER  "10.1.24.1"
 extern esp_mqtt_client_handle_t mqtt_client;
