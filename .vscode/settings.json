@@ -5,15 +5,15 @@
   "idf.espAdfPathWin": "C:\\Users\\echivalan\\.espressif\\esp-adf",
   "idf.espMdfPathWin": "C:\\Users\\echivalan\\.espressif\\esp-mdf",
   "idf.openOcdConfigs": [
-    "board/esp32c6-ftdi.cfg"
+    "board/esp32c3-builtin.cfg"
   ],
-  "idf.portWin": "COM8",
+  "idf.portWin": "COM6",
   "idf.toolsPathWin": "C:\\ESP32VSCode\\Espressif",
   "idf.customExtraVars": {
     "OPENOCD_SCRIPTS": "C:\\Users\\sawer\\.espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20230921/openocd-esp32/share/openocd/scripts",
     "IDF_CCACHE_ENABLE": "1",
     "ESP_ROM_ELF_DIR": "C:\\Users\\sawer\\.espressif\\tools\\esp-rom-elfs\\20230320/",
-    "IDF_TARGET": "esp32c6"
+    "IDF_TARGET": "esp32c3"
   },
   "clangd.path": "c:\\Users\\sawer\\.espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
@@ -29,5 +29,6 @@
     "freertos.h": "c",
     "i2c.h": "c"
   },
-  "idf.flashType": "UART"
+  "idf.flashType": "JTAG",
+  "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.5.3/"
 }

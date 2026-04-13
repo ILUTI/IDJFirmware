@@ -1,3 +1,4 @@
+// Codigo ESP32-C3 maestro IDJ
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -45,8 +46,8 @@ const char* buscar_unidad_por_rom(uint64_t rom) {
     return "Desconocido";
 }
 
-#define I2C_MASTER_SCL_IO 10  // Cambia aquí el pin SCL (IO10)
-#define I2C_MASTER_SDA_IO 11  // Cambia aquí el pin SDA (IO11)
+#define I2C_MASTER_SCL_IO 3 // SCL IO4
+#define I2C_MASTER_SDA_IO 4 // SDA IO5
 #define I2C_MASTER_NUM I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ 100000
 
@@ -74,11 +75,15 @@ void app_main(void) {
     i2c_param_config(I2C_MASTER_NUM, &conf);
     i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
 
+    // Inicialización del DS2482 y detección del dispositivo I2C
     ds2482_t ds2482;
     esp_err_t err = ds2482_init(&ds2482, I2C_MASTER_NUM, DS2482_I2C_ADDR);
     if (err != ESP_OK) {
         printf("No se detecta el DS2482 en el bus I2C.\n");
         return;
+    }
+    else {
+        printf("DS2482 detectado correctamente en el bus I2C.\n");
     }
 
     uint8_t status = 0;
@@ -89,6 +94,7 @@ void app_main(void) {
     }
     printf("Registro de estado DS2482: 0x%02X\n", status);
 
+    // Detección de la presencia del dispositivo 1-Wire
     bool presence = false;
     err = ds2482_1wire_reset(&presence);
     if (err != ESP_OK) {
@@ -101,8 +107,8 @@ void app_main(void) {
         printf("No se detectó dispositivo 1-Wire (presencia=0)\n");
     }
 
+    // ------------------------------ Para Pruebas, detectar un dispositivo 1-Wire y mostrar su ROM ------------------------------
     //Detecta solo un dispositivo 1-Wire
-    /*
     uint64_t rom_code = 0;
     err = ds2482_search_rom(&rom_code);
     if (err == ESP_OK) {
@@ -110,10 +116,8 @@ void app_main(void) {
     } else {
         printf("Error buscando la dirección ROM del dispositivo 1-Wire.\n");
     }
-    */
 
     //Escaneo de ROM's
-    /*
     while (1)
     {
     uint64_t roms[5];
@@ -128,10 +132,16 @@ void app_main(void) {
             printf("Error buscando dispositivos 1-Wire.\n");
         }
         vTaskDelay(pdMS_TO_TICKS(5000)); // Espera 5 segundos antes de la siguiente iteración
+
+    printf("Presence detect: %d\n", presence);
+    printf("Error code: %d\n", err);
     }
-    */
-    
+
+
+
+    // ---------------------------------------- MAPEO CON ROMS DE LA TABLA ----------------------------------------
     //Mapeo de unidades y match con ROM's
+    /*
     while(1){
         uint64_t roms[5];
         size_t found = 0;
@@ -163,4 +173,5 @@ void app_main(void) {
         
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
+    */
 }
