@@ -31,12 +31,22 @@
 #define MAX_DEVICES 20 // definir la cantidad maxima de dispositivos para guardar
 typedef struct {
     uint64_t rom; // rom unica de cada ds2431
+    char rom_str[17]; // representación en string del rom para JSON (16 caracteres + null terminator)
     char unidad[12];   // "T0603-xxxx" codigo para jaulas
     bool asignado; // indicador para saber si ya fue asignado o no.
 } dispositivo_t;
 
 static dispositivo_t dispositivos[MAX_DEVICES]; // asigno el tamaño del arreglo
 static size_t num_dispositivos = 0; // contador de dispositivos registrados
+
+// normalización de ROM para formato consistente
+void rom_to_string(uint64_t rom, char *output) {
+    uint8_t *bytes = (uint8_t*)&rom;
+    for (int i = 0; i < 8; i++) {
+        sprintf(output + (i * 2), "%02X", bytes[7 - i]);
+    }
+    output[16] = '\0';
+}
 
 // 2. Funciones para registro de dispositivos en la NVS, guardo y cargo el JSON
 // Funcion para guardar en la NVS del esp32
@@ -50,10 +60,7 @@ void guardar_en_nvs() {
     for (size_t i = 0; i < num_dispositivos; i++) {
         cJSON *obj = cJSON_CreateObject();
 
-        char rom_str[17];
-        sprintf(rom_str, "%016llX", dispositivos[i].rom);
-
-        cJSON_AddStringToObject(obj, "rom", rom_str);
+        cJSON_AddStringToObject(obj, "rom", dispositivos[i].rom_str);
         cJSON_AddStringToObject(obj, "unidad", dispositivos[i].unidad);
         cJSON_AddBoolToObject(obj, "asignado", dispositivos[i].asignado);
 
@@ -93,11 +100,11 @@ void cargar_desde_nvs() {
             uint64_t rom = strtoull(rom_str, NULL, 16);
 
             dispositivos[num_dispositivos].rom = rom;
-            strcpy(dispositivos[num_dispositivos].unidad,
-                   cJSON_GetObjectItem(item, "unidad")->valuestring);
-            dispositivos[num_dispositivos].asignado =
-                   cJSON_GetObjectItem(item, "asignado")->valueint;
+            rom_to_string(rom, dispositivos[num_dispositivos].rom_str); 
 
+            strcpy(dispositivos[num_dispositivos].unidad, cJSON_GetObjectItem(item, "unidad")->valuestring);
+            dispositivos[num_dispositivos].asignado = cJSON_GetObjectItem(item, "asignado")->valueint;
+            
             num_dispositivos++;
         }
 
@@ -110,9 +117,9 @@ void cargar_desde_nvs() {
 
 // Funcion que me devuelve si existe o no dispositivo registrado con un rom específico, 
 // evitando duplicados en la memoria. 
-bool existe_dispositivo(uint64_t rom) {
+bool existe_dispositivo_str(const char *rom_str) {
     for (size_t i = 0; i < num_dispositivos; i++) {
-        if (dispositivos[i].rom == rom) {
+        if (strcmp(dispositivos[i].rom_str, rom_str) == 0) {
             return true;
         }
     }
@@ -126,15 +133,21 @@ void agregar_dispositivo(uint64_t rom) {
         return;
     }
 
-    dispositivos[num_dispositivos].rom = rom;
-    strcpy(dispositivos[num_dispositivos].unidad, "");
-    dispositivos[num_dispositivos].asignado = false;
+    size_t idx = num_dispositivos;
+
+    rom_to_string(rom, dispositivos[idx].rom_str);
+    dispositivos[idx].rom = rom;
+    strcpy(dispositivos[idx].unidad, "");
+    dispositivos[idx].asignado = false;
+
+    
+
+    printf("Nuevo dispositivo agregado: %s\n", dispositivos[idx].rom_str);
+    ESP_LOGI("IDJ", "Nuevo dispositivo agregado: %s", dispositivos[idx].rom_str);
 
     num_dispositivos++;
 
-    printf("Nuevo dispositivo agregado: %016llX\n", rom); // formato hexadecimal para el rom y para long long (64 bits)
-
-    guardar_en_nvs();  // persistencia inmediata
+    guardar_en_nvs();
 }
 
 
@@ -198,7 +211,7 @@ void app_main(void) {
         printf("No se detectó dispositivo 1-Wire (presencia=0)\n");
     }
 
-    // ------------------------------ Para Pruebas, detectar un dispositivo 1-Wire y mostrar su ROM ------------------------------
+    // ------------------------------ Detecta automaticamente un dispositivo y muestra su rom ------------------------------
     //Detecta solo un dispositivo 1-Wire
     uint64_t rom_code = 0;
     err = ds2482_search_rom(&rom_code);
@@ -218,22 +231,29 @@ void app_main(void) {
 
     if (err == ESP_OK) {
         printf("Se encontraron %zu dispositivos:\n", found);
-
         for (size_t i = 0; i < found; i++) {
+            char rom_str[17];
+            rom_to_string(roms[i], rom_str);
 
-            printf("ROM: %016llX\n", roms[i]);
+            if (existe_dispositivo_str(rom_str)) {
 
-            if (!existe_dispositivo(roms[i])) {
+                for (size_t j = 0; j < num_dispositivos; j++) {
+                    if (strcmp(dispositivos[j].rom_str, rom_str) == 0) {
+                        break;
+                    }
+                }
+            } else {
                 agregar_dispositivo(roms[i]);
             }
+            
         }
     }
 
     // Mostrar estado actual
     printf("----- TABLA LOCAL -----\n");
     for (size_t i = 0; i < num_dispositivos; i++) {
-        printf("ROM: %016llX | Unidad: %s | Asignado: %d\n",
-               dispositivos[i].rom,
+        printf("ROM: %s | Unidad: %s | Asignado: %d\n",
+               dispositivos[i].rom_str,
                dispositivos[i].unidad,
                dispositivos[i].asignado);
     }
