@@ -200,3 +200,45 @@ esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *foun
 
     return ESP_OK;
 }
+
+// Comando Write Configuration del DS2482
+#define DS2482_CMD_WRITE_CONFIG  0xD2
+
+esp_err_t ds2482_configure(ds2482_t *dev, uint8_t config) {
+    // Construir el byte de configuración con complemento en nibble alto
+    uint8_t config_byte = DS2482_CFG_BYTE(config);
+
+    uint8_t buf[2] = { DS2482_CMD_WRITE_CONFIG, config_byte };
+
+    esp_err_t err = i2c_master_write_to_device(
+        dev->i2c_num,
+        dev->address,
+        buf,
+        sizeof(buf),
+        pdMS_TO_TICKS(100)
+    );
+
+    if (err != ESP_OK) {
+        ESP_LOGE("DS2482", "Error escribiendo configuración: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Leer de vuelta el registro de configuración para verificar
+    // El DS2482 devuelve solo los 4 bits bajos si la escritura fue exitosa
+    uint8_t readback = 0;
+    err = ds2482_read_register(&readback);
+    if (err != ESP_OK) return err;
+
+    if ((readback & 0x0F) != (config & 0x0F)) {
+        ESP_LOGE("DS2482", "Configuración rechazada por DS2482. Byte enviado: 0x%02X, recibido: 0x%02X",
+                 config_byte, readback);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    ESP_LOGI("DS2482", "Configuración aplicada: APU=%d SPU=%d 1WS=%d",
+             (config & DS2482_CFG_APU) ? 1 : 0,
+             (config & DS2482_CFG_SPU) ? 1 : 0,
+             (config & DS2482_CFG_1WS) ? 1 : 0);
+
+    return ESP_OK;
+}

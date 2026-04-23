@@ -26,3 +26,14 @@ esp_err_t ds2482_busy_wait();
 esp_err_t ds2482_1wire_triplet(uint8_t direction, uint8_t *status);
 esp_err_t ds2482_read_status(ds2482_t *dev, uint8_t *status);
 esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *found);
+
+// Bits del registro de configuración del DS2482
+#define DS2482_CFG_APU  (1 << 0)  // Active Pullup — necesario para cables largos
+#define DS2482_CFG_SPU  (1 << 2)  // Strong Pullup
+#define DS2482_CFG_1WS  (1 << 3)  // 1-Wire Speed (overdrive)
+
+// El byte de configuración requiere que los 4 bits altos sean el complemento
+// de los 4 bits bajos. Esta macro lo construye correctamente.
+#define DS2482_CFG_BYTE(cfg)  ((cfg) | ((~(cfg) & 0x0F) << 4))
+
+esp_err_t ds2482_configure(ds2482_t *dev, uint8_t config);
