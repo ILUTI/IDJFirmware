@@ -49,10 +49,10 @@ void rom_to_string(uint64_t rom, char *output) {
 }
 
 // También una función de validación del Family Code del DS2431
-// El DS2431 siempre tiene Family Code = 0x2B en byte[0].
+// El DS2431 siempre tiene Family Code = 0x2D en byte[0].
 bool rom_es_ds2431(uint64_t rom) {
     uint8_t family = (uint8_t)(rom & 0xFF); // byte[0] en little-endian es el LSB
-    return (family == 0x2B);
+    return (family == 0x2D);
 }
 
 // 2. Funciones para registro de dispositivos en la NVS, guardo y cargo el JSON
