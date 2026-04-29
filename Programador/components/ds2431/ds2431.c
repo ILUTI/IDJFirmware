@@ -196,81 +196,99 @@ esp_err_t ds2431_read_memory(ds2482_t *ds2482, ds2431_t *dev,
 // ─────────────────────────────────────────────
 esp_err_t ds2431_escribir_datos(ds2482_t *ds2482, ds2431_t *dev,
                                  const ds2431_data_t *datos) {
-    // Construir el buffer completo de 22 bytes según el mapa IDJ
     uint8_t buf[DS2431_EEPROM_DATA_LEN];
     memset(buf, 0x00, sizeof(buf));
 
-    // Magic number
-    buf[0] = DS2431_MAGIC_BYTE0;  // 'I'
-    buf[1] = DS2431_MAGIC_BYTE1;  // 'D'
-
-    // Número de jaula (little-endian)
+    // Construir buffer igual que antes
+    buf[0] = DS2431_MAGIC_BYTE0;
+    buf[1] = DS2431_MAGIC_BYTE1;
     buf[2] = (uint8_t)(datos->numero_jaula & 0xFF);
     buf[3] = (uint8_t)(datos->numero_jaula >> 8);
-
-    // Código de unidad (12 bytes, null-padded)
     strncpy((char *)&buf[4], datos->unidad, 11);
-    buf[15] = 0x00;  // garantizar null-terminator
-
-    // Timestamp (little-endian)
+    buf[15] = 0x00;
     buf[16] = (uint8_t)(datos->timestamp & 0xFF);
     buf[17] = (uint8_t)((datos->timestamp >> 8)  & 0xFF);
     buf[18] = (uint8_t)((datos->timestamp >> 16) & 0xFF);
     buf[19] = (uint8_t)((datos->timestamp >> 24) & 0xFF);
-
-    // CRC-16 de bytes 0x00–0x13 (primeros 20 bytes)
     uint16_t crc = ds2431_crc16(buf, 20);
     buf[20] = (uint8_t)(crc & 0xFF);
     buf[21] = (uint8_t)(crc >> 8);
 
-    ESP_LOGI(TAG, "Escribiendo jaula #%d unidad '%s' timestamp %lu CRC 0x%04X",
-             datos->numero_jaula, datos->unidad, datos->timestamp, crc);
+    ESP_LOGI(TAG, "Escribiendo jaula #%d unidad '%s' CRC 0x%04X",
+             datos->numero_jaula, datos->unidad, crc);
 
-    // Escribir en bloques de 8 bytes (páginas del DS2431)
-    // El DS2431 tiene páginas de 8 bytes — cada Write+Copy es una página
-    esp_err_t err;
-    size_t total = sizeof(buf);
+    size_t total   = sizeof(buf);
     size_t escrito = 0;
 
     while (escrito < total) {
         size_t bloque = (total - escrito > 8) ? 8 : (total - escrito);
         uint16_t addr = (uint16_t)escrito;
 
-        // 1. Escribir al scratchpad
-        err = ds2431_write_scratchpad(ds2482, dev, addr, &buf[escrito], bloque);
+        // ── 1. Write Scratchpad ──────────────────────────────────
+        esp_err_t err = ds2431_write_scratchpad(ds2482, dev, addr,
+                                                 &buf[escrito], bloque);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Fallo write scratchpad en bloque addr=0x%02X", addr);
+            ESP_LOGE(TAG, "Fallo write scratchpad addr=0x%02X", addr);
             return err;
         }
 
-        // 2. Leer scratchpad de vuelta para verificar
+        // ── 2. Read Scratchpad — capturar TA1, TA2 y ES del dispositivo
+        //    IMPORTANTE: el ES lo genera el DS2431 internamente.
+        //    Nunca calcularlo — siempre leerlo aquí y pasarlo al Copy.
+        uint8_t ta1, ta2, es_byte;
         uint8_t verify[8];
-        uint16_t addr_readback;
-        err = ds2431_read_scratchpad(ds2482, dev, &addr_readback, verify, bloque);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Fallo read scratchpad en bloque addr=0x%02X", addr);
-            return err;
+
+        err = ds2431_match_rom(ds2482, dev);
+        if (err != ESP_OK) return err;
+
+        err = ds2482_write_byte(DS2431_CMD_READ_SCRATCHPAD);
+        if (err != ESP_OK) return err;
+
+        // Leer los 3 bytes de cabecera: TA1, TA2, ES
+        err = ds2482_read_byte(&ta1);     if (err != ESP_OK) return err;
+        err = ds2482_read_byte(&ta2);     if (err != ESP_OK) return err;
+        err = ds2482_read_byte(&es_byte); if (err != ESP_OK) return err;
+
+        // Leer los datos del scratchpad para verificar
+        for (size_t i = 0; i < bloque; i++) {
+            err = ds2482_read_byte(&verify[i]);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Fallo leyendo scratchpad byte %d", i);
+                return err;
+            }
         }
 
+        ESP_LOGD(TAG, "Scratchpad: TA1=0x%02X TA2=0x%02X ES=0x%02X",
+                 ta1, ta2, es_byte);
+
+        // Verificar que los datos coinciden
         if (memcmp(&buf[escrito], verify, bloque) != 0) {
             ESP_LOGE(TAG, "Verificación scratchpad falló en addr=0x%02X", addr);
+            ESP_LOGE(TAG, "Esperado: ");
+            for (size_t i = 0; i < bloque; i++) ESP_LOGE(TAG, "  [%d] 0x%02X vs 0x%02X", i, buf[escrito+i], verify[i]);
             return ESP_ERR_INVALID_RESPONSE;
         }
 
-        // 3. Commit a EEPROM — ES byte = (addr + bloque - 1) & 0x07
-        uint8_t es_byte = (uint8_t)((addr + bloque - 1) & 0x07);
-        err = ds2431_copy_scratchpad(ds2482, dev, addr, es_byte);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Fallo copy scratchpad en bloque addr=0x%02X", addr);
-            return err;
-        }
+        // ── 3. Copy Scratchpad — usar ES leído del dispositivo ───
+        err = ds2431_match_rom(ds2482, dev);
+        if (err != ESP_OK) return err;
 
+        err = ds2482_write_byte(DS2431_CMD_COPY_SCRATCHPAD);
+        if (err != ESP_OK) return err;
+
+        // Enviar exactamente los mismos TA1, TA2, ES que devolvió el Read
+        err = ds2482_write_byte(ta1);     if (err != ESP_OK) return err;
+        err = ds2482_write_byte(ta2);     if (err != ESP_OK) return err;
+        err = ds2482_write_byte(es_byte); if (err != ESP_OK) return err;
+
+        // Esperar tiempo de grabación EEPROM (datasheet DS2431: máx 10ms)
+        vTaskDelay(pdMS_TO_TICKS(DS2431_COPY_SCRATCHPAD_DELAY_MS));
+
+        ESP_LOGI(TAG, "Bloque 0x%02X–0x%02X grabado OK", addr, (uint16_t)(addr + bloque - 1));
         escrito += bloque;
-        ESP_LOGD(TAG, "Bloque 0x%02X–0x%02X grabado OK", addr, addr + bloque - 1);
     }
 
-    ESP_LOGI(TAG, "Escritura EEPROM completa — %d bytes en %d bloques",
-             total, (total + 7) / 8);
+    ESP_LOGI(TAG, "Escritura EEPROM completa");
     return ESP_OK;
 }
 
