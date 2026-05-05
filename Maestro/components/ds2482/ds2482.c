@@ -77,11 +77,21 @@ esp_err_t ds2482_write_byte(uint8_t byte) {
     return i2c_master_write_to_device(g_i2c_num, g_i2c_addr, cmd, 2, pdMS_TO_TICKS(100));
 }
 
+#define DS2482_REG_DATA           0xE1  // registro de datos del DS2482
+
 esp_err_t ds2482_read_byte(uint8_t *data) {
     uint8_t cmd = DS2482_CMD_READ_BYTE;
+    // 1. Esperar que el bus esté libre
     ESP_ERROR_CHECK(ds2482_busy_wait());
+    // 2. Enviar comando Read Byte — inicia la lectura en el bus 1-Wire
     ESP_ERROR_CHECK(i2c_master_write_to_device(g_i2c_num, g_i2c_addr, &cmd, 1, pdMS_TO_TICKS(100)));
-    vTaskDelay(pdMS_TO_TICKS(2));
+    // 3. Esperar que el DS2482 termine de leer el byte del bus 1-Wire
+    ESP_ERROR_CHECK(ds2482_busy_wait());
+    // 4. Apuntar el read pointer al registro de DATOS (0xE1)
+    //    Sin esto, lees el registro de status (0xF0) 
+    uint8_t set_ptr[2] = { DS2482_CMD_SET_READ_PTR, DS2482_REG_DATA };
+    ESP_ERROR_CHECK(i2c_master_write_to_device(g_i2c_num, g_i2c_addr, set_ptr, 2, pdMS_TO_TICKS(100)));
+    // 5. Leer el dato
     return i2c_master_read_from_device(g_i2c_num, g_i2c_addr, data, 1, pdMS_TO_TICKS(100));
 }
 
