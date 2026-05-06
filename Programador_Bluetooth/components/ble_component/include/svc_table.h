@@ -1,0 +1,21 @@
+#include <stdio.h>
+
+
+/* Attributes SRVC Table */
+enum
+{
+    DEVICE_SVC,
+    DEVICE_CHAR_ID,
+    DEVICE_CHAR_VAL_ID,
+
+    DEVICE_CHAR_WIFI_SSID,
+    DEVICE_CHAR_VAL_WIFI_SSID,
+
+    DEVICE_CHAR_WIFI_PSWD,
+    DEVICE_CHAR_VAL_WIFI_PSWD,
+
+    DEVICE_CHAR_JAULA,
+    DEVICE_CHAR_VAL_JAULA,
+
+    DEVICE_IDX_NB,
+};
