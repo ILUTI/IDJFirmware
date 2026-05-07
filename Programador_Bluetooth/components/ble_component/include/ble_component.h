@@ -43,4 +43,7 @@ void ble_init();
 /// @brief Disable Bluetooth and advertisement BLE Service
 void ble_deinit();
 
+/// @brief Envia una notificacion de texto al celular
+void ble_enviar_status(const char* mensaje);
+
 #endif // BLE_COMPONENT_H  // End of the include guard

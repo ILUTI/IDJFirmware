@@ -115,20 +115,22 @@ void app_main(void) {
     ESP_LOGI(TAG, "1. Conecta el esclavo a programar.");
     ESP_LOGI(TAG, "2. Envía el número de jaula (texto) vía nRF Connect.");
 
+    // Ciclo While Principal --------------------------------------------------------
+
     while (1) {
         uint16_t nueva_jaula = 0;
         
         // El ESP32 se queda suspendido aquí sin gastar CPU hasta que llegue un dato por BLE
-        if (xQueueReceive(cola_programacion_jaula, &nueva_jaula, portMAX_DELAY) == pdTRUE) {
+if (xQueueReceive(cola_programacion_jaula, &nueva_jaula, portMAX_DELAY) == pdTRUE) {
             
             ESP_LOGI(TAG, "\n------------------------------------------------");
-            ESP_LOGI(TAG, "🚀 ORDEN RECIBIDA: Iniciar programación para Jaula #%d", nueva_jaula);
+            ESP_LOGI(TAG, "🚀 ORDEN RECIBIDA: Programar Jaula #%d", nueva_jaula);
             
-            // 1. Detectar si físicamente hay algo conectado
+            // 1. Reset y Verificación de presencia
             bool presence = false;
             ds2482_1wire_reset(&presence);
             if (!presence) {
-                ESP_LOGE(TAG, "OPERACIÓN CANCELADA: No hay ningún esclavo conectado.");
+                ble_enviar_status("ERROR: No hay esclavo conectado");
                 continue;
             }
 
@@ -137,63 +139,58 @@ void app_main(void) {
             size_t found = 0;
             ds2482_search_rom_all(roms, 2, &found);
 
-            if (found == 0) {
-                ESP_LOGE(TAG, "OPERACIÓN CANCELADA: No se pudo leer el ROM.");
-                continue;
-            } else if (found > 1) {
-                ESP_LOGE(TAG, "OPERACIÓN CANCELADA: Múltiples esclavos (%zu) detectados. Conecta solo UNO.", found);
+            if (found != 1) {
+                ble_enviar_status("ERROR: Bus ocupado o multi-drop");
                 continue;
             }
-
-            uint8_t *b = (uint8_t *)&roms[0];
-            printf("ROM a programar: %02X%02X%02X%02X%02X%02X%02X%02X\n", b[7], b[6], b[5], b[4], b[3], b[2], b[1], b[0]);
 
             ds2431_t esclavo = { .rom_code = roms[0] };
-
-            // ====================================================================
-            // 3. NUEVO: LEER ESTADO ACTUAL ANTES DE SOBRESCRIBIR
-            // ====================================================================
-            ds2431_data_t datos_actuales;
-            ESP_LOGI(TAG, "🔍 Verificando memoria actual del esclavo...");
             
-            esp_err_t err_lectura = ds2431_leer_datos(&ds2482, &esclavo, &datos_actuales);
+            // ==========================================================
+            // 3. LEER ESTADO ANTERIOR Y PREPARAR NOTIFICACIÓN
+            // ==========================================================
+            ds2431_data_t datos_previos;
+            char info_anterior[32]; // Para guardar el texto del estado viejo
             
-            if (err_lectura == ESP_OK && datos_actuales.valido) {
-                ESP_LOGW(TAG, "⚠️ ATENCIÓN: Este esclavo YA TIENE información.");
-                ESP_LOGW(TAG, "Unidad actual: %s (Jaula #%d)", datos_actuales.unidad, datos_actuales.numero_jaula);
-                ESP_LOGW(TAG, "Procediendo a sobrescribirla con la nueva Jaula #%d...", nueva_jaula);
+            esp_err_t err_read = ds2431_leer_datos(&ds2482, &esclavo, &datos_previos);
+            
+            if (err_read == ESP_OK && datos_previos.valido) {
+                // El esclavo ya tenía un número
+                snprintf(info_anterior, sizeof(info_anterior), "#%d", datos_previos.numero_jaula);
+                ESP_LOGW(TAG, "Cambiando de Jaula %s a #%d", info_anterior, nueva_jaula);
             } else {
-                ESP_LOGI(TAG, "ℹ️ El esclavo está virgen o vacío. Procediendo a grabar...");
+                // El esclavo estaba vacío o corrupto
+                strcpy(info_anterior, "NUEVA/VACIA");
+                ESP_LOGI(TAG, "Esclavo sin asignar. Asignando #%d", nueva_jaula);
             }
-            // ====================================================================
 
-            // 4. Preparar nuevos datos
+            // 4. Preparar y Escribir nuevos datos
             char unidad[12];
             generar_unidad(nueva_jaula, unidad);
-
-            ds2431_data_t datos = {
+            ds2431_data_t datos_nuevos = {
                 .numero_jaula = nueva_jaula,
                 .timestamp    = 0,
                 .valido       = false,
             };
-            strncpy(datos.unidad, unidad, 11);
-            datos.unidad[11] = '\0';
+            strncpy(datos_nuevos.unidad, unidad, 11);
+            datos_nuevos.unidad[11] = '\0';
 
-            // 5. Escribir en la EEPROM
-            ESP_LOGI(TAG, "Quemando EEPROM con %s...", unidad);
-            esp_err_t err = ds2431_escribir_datos(&ds2482, &esclavo, &datos);
+            esp_err_t err_write = ds2431_escribir_datos(&ds2482, &esclavo, &datos_nuevos);
             
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "❌ ERROR DE ESCRITURA: %s", esp_err_to_name(err));
-                continue;
-            }
+            // 5. Verificación física y Envío de Status por BLE
+            if (err_write == ESP_OK && verificar_eeprom(&ds2482, &esclavo)) {
+                
+                // CONSTRUIR MENSAJE FINAL PARA EL CELULAR
+                char msg_final[64];
+                snprintf(msg_final, sizeof(msg_final), "OK! [%s] -> [#%d]", info_anterior, nueva_jaula);
+                
+                ESP_LOGI(TAG, "⭐⭐ %s ⭐⭐", msg_final);
+                
+                // ENVIAR AL CELULAR
+                ble_enviar_status(msg_final); 
 
-            // 6. Verificación Final FÍSICA
-            ESP_LOGI(TAG, "Escritura finalizada. Iniciando comprobación física...");
-            if (verificar_eeprom(&ds2482, &esclavo)) {
-                ESP_LOGI(TAG, "⭐⭐ TODO OK — Jaula #%d lista. Puedes desconectar. ⭐⭐", nueva_jaula);
             } else {
-                ESP_LOGE(TAG, "❌ FALLO CRÍTICO: Los datos quedaron corruptos.");
+                ble_enviar_status("ERROR: Fallo en grabado físico");
             }
         }
     }

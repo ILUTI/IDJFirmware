@@ -13,6 +13,11 @@ static uint8_t adv_config_done=0;
 // DEVICE UUID TABLE ARRAY
 static uint16_t device_handle_table[DEVICE_IDX_NB];
 
+// ---> VARIABLES PARA RECORDAR LA CONEXIÓN BLE <---
+uint16_t ble_gatts_if = ESP_GATT_IF_NONE;
+uint16_t ble_conn_id = 0xffff;
+bool ble_is_connected = false;
+
 // Service UUID
 static uint8_t service_uuid[16] = {
     /* LSB <--------------------------------------------------------------------------------> MSB */
@@ -98,12 +103,16 @@ static const uint16_t GATTS_CHAR_UUID_ID        = 0xFF0A;   //Lookup for UUID ge
 static const uint16_t GATTS_CHAR_UUID_WIFI_SSID     = 0xA0B2;   //Lookup for UUID generators
 static const uint16_t GATTS_CHAR_UUID_WIFI_PSWD     = 0xA0B3;   //Lookup for UUID generators
 static const uint16_t GATTS_CHAR_UUID_JAULA         = 0xA0B4;
+static const uint16_t GATTS_CHAR_UUID_STATUS = 0xA0B5; // Nueva dirección
 
 static const uint16_t primary_service_uuid         = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid   = ESP_GATT_UUID_CHAR_DECLARE;
 //static const uint8_t char_prop_write               = ESP_GATT_CHAR_PROP_BIT_WRITE;
 //static const uint8_t char_prop_read                = ESP_GATT_CHAR_PROP_BIT_READ;
 static const uint8_t char_prop_read_write          = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ;
+static const uint16_t character_client_config_uuid = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+static const uint8_t char_prop_read_notify = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+static const uint8_t notification_ccc[2] = {0x01, 0x00}; // Activa notificaciones
 static const uint8_t char_value[4]                 = {0x11, 0x22, 0x33, 0x44};
 
 
@@ -154,6 +163,18 @@ static const esp_gatts_attr_db_t gatt_db[DEVICE_IDX_NB] =
     [DEVICE_CHAR_VAL_JAULA] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_JAULA, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
       GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
+
+    [DEVICE_CHAR_STATUS] =
+    {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
+    CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_notify}},
+
+    [DEVICE_CHAR_VAL_STATUS] =
+    {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_STATUS, ESP_GATT_PERM_READ,
+    GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
+
+    [DEVICE_CHAR_CFG_STATUS] = // Este permite que el celular se "suscriba" a los mensajes
+    {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+    sizeof(notification_ccc), sizeof(notification_ccc), (uint8_t *)notification_ccc}},
 
 
       
@@ -231,7 +252,7 @@ static void handle_read_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *
 static void handle_write_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
 
         ESP_LOGI(BLE_TAG, "WRITE_EVT, handle = %d, value len = %d, value : %s", param->write.handle, param->write.len, param->write.value);
-        esp_log_buffer_hex(BLE_TAG, param->write.value, param->write.len);
+        ESP_LOG_BUFFER_HEX(BLE_TAG, param->write.value, param->write.len);
         char value[param->write.len + 1];
         memcpy(value, param->write.value, param->write.len);
         value[param->write.len] = '\0';
@@ -365,7 +386,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             if (!param->write.is_prep){
 
                 ESP_LOGI(BLE_TAG, "WRITE_EVT, handle = %d, value len = %d, value :", param->write.handle, param->write.len);
-                esp_log_buffer_hex(BLE_TAG, param->write.value, param->write.len);
+                ESP_LOG_BUFFER_HEX(BLE_TAG, param->write.value, param->write.len);
                 handle_write_event(gatts_if, param);
                 if (param->write.need_rsp){
                         esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
@@ -387,7 +408,12 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             break;
         case ESP_GATTS_CONNECT_EVT:
             ESP_LOGI(BLE_TAG, "ESP_GATTS_CONNECT_EVT, conn_id = %d", param->connect.conn_id);
-            esp_log_buffer_hex(BLE_TAG, param->connect.remote_bda, 6);
+            // ---> GUARDAMOS LA CONEXIÓN PARA LAS NOTIFICACIONES <---
+            ble_gatts_if = gatts_if;
+            ble_conn_id = param->connect.conn_id;
+            ble_is_connected = true;
+
+            ESP_LOG_BUFFER_HEX(BLE_TAG, param->connect.remote_bda, 6);
             esp_ble_conn_update_params_t conn_params = {0};
             memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
             /* For the iOS system, please refer to Apple official documents about the BLE connection parameters restrictions. */
@@ -400,6 +426,8 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             break;
         case ESP_GATTS_DISCONNECT_EVT:
             ESP_LOGI(BLE_TAG, "ESP_GATTS_DISCONNECT_EVT, reason = 0x%x", param->disconnect.reason);
+            // ---> BORRAMOS LA CONEXIÓN <---
+            ble_is_connected = false;
             esp_ble_gap_start_advertising(&adv_params);
             break;
         case ESP_GATTS_CREAT_ATTR_TAB_EVT:{
@@ -529,6 +557,30 @@ void ble_init(){
     }
 }
 
+
+/// @brief Envia una notificacion de texto al celular
+/// @param mensaje Texto a enviar
+void ble_enviar_status(const char* mensaje) {
+    if (!ble_is_connected) {
+        ESP_LOGW(BLE_TAG, "No hay cliente BLE conectado para enviar notificacion");
+        return;
+    }
+
+    // Buscamos la direccion (handle) de nuestro buzón de status
+    uint16_t attr_handle = device_handle_table[DEVICE_CHAR_VAL_STATUS];
+    
+    // Enviamos el mensaje
+    esp_ble_gatts_send_indicate(
+        ble_gatts_if,
+        ble_conn_id,
+        attr_handle,
+        strlen(mensaje),
+        (uint8_t *)mensaje,
+        false); // false = Notificación (sin confirmación), true = Indicación
+        
+    ESP_LOGI(BLE_TAG, "Notificación enviada: %s", mensaje);
+}
+
 /// @brief Disable Bluetooth and advertisement BLE Service
 void ble_deinit(){
     esp_err_t ret;
@@ -566,3 +618,6 @@ void ble_deinit(){
     }
 
 }
+
+
+
