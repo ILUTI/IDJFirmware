@@ -1,8 +1,8 @@
 {
     "idf.flashType": "UART",
-    "idf.portWin": "COM25",
+    "idf.portWin": "COM35",
     "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.5.3/",
-    "idf.monitorPort": "COM25",
+    "idf.monitorPort": "COM35",
     "idf.openOcdConfigs": [
         "board/esp32c3-builtin.cfg"
     ],

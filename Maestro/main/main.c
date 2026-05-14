@@ -50,12 +50,29 @@ void rom_to_string(uint64_t rom, char *output) {
     output[16] = '\0';
 }
 
+// Convierte el string del JSON de vuelta a uint64_t respetando el orden físico (Little-Endian)
+uint64_t string_to_rom(const char *str) {
+    uint64_t rom = 0;
+    uint8_t *bytes = (uint8_t*)&rom;
+    for (int i = 0; i < 8; i++) {
+        // Leemos de 2 en 2 caracteres y los guardamos secuencialmente en la RAM
+        sscanf(str + (i * 2), "%2hhx", &bytes[i]); 
+    }
+    return rom;
+}
+
 // También una función de validación del Family Code del DS2431
 // El DS2431 siempre tiene Family Code = 0x2D en byte[0].
 bool rom_es_ds2431(uint64_t rom) {
     uint8_t family = (uint8_t)(rom & 0xFF); // byte[0] en little-endian es el LSB
     return (family == 0x2D);
 }
+
+// Genera "T0603-xxxx" a partir del número de jaula
+void generar_unidad(uint16_t jaula, char *out) {
+    snprintf(out, 12, "T0603-%04d", jaula);
+}
+// -----------------------------------
 
 // 2. Funciones para registro de dispositivos en la NVS, guardo y cargo el JSON
 // Funcion para guardar en la NVS del esp32
@@ -129,13 +146,14 @@ void cargar_desde_nvs() {
                 // Verificar que los campos existen antes de usarlos
                 if (!rom_item || !unidad_item || !asig_item) continue;
 
-                uint64_t rom = strtoull(rom_item->valuestring, NULL, 16);
+                uint64_t rom = string_to_rom(rom_item->valuestring);
                 dispositivos[num_dispositivos].rom = rom;
                 rom_to_string(rom, dispositivos[num_dispositivos].rom_str);
                 strncpy(dispositivos[num_dispositivos].unidad, unidad_item->valuestring, 11);
                 dispositivos[num_dispositivos].unidad[11] = '\0'; // garantizar null-terminator
                 dispositivos[num_dispositivos].asignado = (bool)asig_item->valueint;
-
+                // --> NUEVA LÍNEA: Forzar que inicie como desconectada al arrancar
+                dispositivos[num_dispositivos].presente = false;
                 num_dispositivos++;
             }
             cJSON_Delete(root);
@@ -196,71 +214,84 @@ void agregar_dispositivo(uint64_t rom) {
 
 // Función de escaneo extraída del while para mayor claridad
 void escanear_dispositivos(ds2482_t *ds2482) {
-    uint64_t roms[MAX_DEVICES];
-    size_t found = 0;
+    static uint8_t ciclos_escaneo = 0; // Contador para no hacer Search ROM siempre
+    ciclos_escaneo++;
 
-    // 1. Castigo inicial: Asumimos que todas las jaulas se desconectaron.
-    // Les sumamos 1 a sus ausencias.
+    ESP_LOGI(TAG, "--- Iniciando PING a jaulas conocidas ---");
+
+    // =================================================================
+    // FASE 1: "PING" LIVIANO A JAULAS CONOCIDAS (Se hace SIEMPRE)
+    // =================================================================
     for (size_t i = 0; i < num_dispositivos; i++) {
-        if (dispositivos[i].ausencias < 250) { // Evitar overflow
-            dispositivos[i].ausencias++;
-        }
-    }
+        if (dispositivos[i].asignado) {
+            ds2431_t esclavo_conocido = { .rom_code = dispositivos[i].rom };
+            uint8_t buffer[4]; // Solo leemos 4 bytes (Magic ID y Num Jaula)
 
-    esp_err_t err = ds2482_search_rom_all(roms, MAX_DEVICES, &found);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error en búsqueda 1-Wire");
-        return;
-    }
+            // Intentar leer la memoria directamente (sin Search ROM)
+            esp_err_t err_ping = ds2431_read_memory(ds2482, &esclavo_conocido, 0x00, buffer, 4);
 
-    for (size_t i = 0; i < found; i++) {
-        if (!rom_es_ds2431(roms[i])) continue; // Ignorar si no es DS2431
+            if (err_ping == ESP_OK && buffer[0] == DS2431_MAGIC_BYTE0 && buffer[1] == DS2431_MAGIC_BYTE1) {
+                // ¡El esclavo respondió! 
+                dispositivos[i].presente = true;
+                dispositivos[i].ausencias = 0;
+                
+                // Actualizar el número de jaula por si lo reprogramaron en otro lado
+                uint16_t num_jaula = (uint16_t)buffer[2] | ((uint16_t)buffer[3] << 8);
+                generar_unidad(num_jaula, dispositivos[i].unidad);
 
-        char rom_str[17];
-        rom_to_string(roms[i], rom_str);
-
-        // Si es una jaula totalmente nueva, la agregamos
-        if (!existe_dispositivo_str(rom_str)) {
-            agregar_dispositivo(roms[i]);
-        }
-
-        // Buscar el índice de esta jaula en nuestra tabla
-        int idx = -1;
-        for (size_t j = 0; j < num_dispositivos; j++) {
-            if (dispositivos[j].rom == roms[i]) {
-                idx = j;
-                break;
+                ESP_LOGI(TAG, "PING OK: %s sigue conectada.", dispositivos[i].unidad);
+            } else {
+                // Falló el ping, penalizamos
+                if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
+                if (dispositivos[i].ausencias >= 3) dispositivos[i].presente = false;
+                ESP_LOGW(TAG, "PING FALLIDO: Jaula historial ROM %s no responde.", dispositivos[i].rom_str);
             }
         }
+    }
 
-        if (idx != -1) {
-            // ¡SALVACIÓN! Vimos la jaula en el bus. 
-            // Reseteamos sus ausencias y la marcamos como presente.
-            dispositivos[idx].ausencias = 0;
-            dispositivos[idx].presente = true;
+    // =================================================================
+    // FASE 2: DESCUBRIMIENTO PESADO (Solo 1 de cada 6 veces, ej. cada 60s)
+    // =================================================================
+    if (ciclos_escaneo >= 6) {
+        ciclos_escaneo = 0;
+        ESP_LOGI(TAG, "--- Iniciando DESCUBRIMIENTO de nuevas jaulas ---");
+        
+        uint64_t roms[MAX_DEVICES];
+        size_t found = 0;
+        
+        esp_err_t err = ds2482_search_rom_all(roms, MAX_DEVICES, &found);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Search ROM reportó un error o límite de bus. Jaulas encontradas: %zu", found);
+        }
+        
+        for (size_t i = 0; i < found; i++) {
+            if (!rom_es_ds2431(roms[i])) continue;
 
-            // OPTIMIZACIÓN: Solo leemos la EEPROM si la jaula aún NO está asignada.
-            // Si ya sabemos que es la "T0603-xxxx", no perdemos tiempo volviendo a leer.
-            if (!dispositivos[idx].asignado) {
-                ds2431_t esclavo_actual = { .rom_code = roms[i] };
+            char rom_str[17];
+            rom_to_string(roms[i], rom_str);
+
+            if (!existe_dispositivo_str(rom_str)) {
+                ESP_LOGI(TAG, "¡NUEVA JAULA FÍSICA DETECTADA! ROM: %s", rom_str);
+                agregar_dispositivo(roms[i]);
+                
+                // Leer la memoria completa solo la primera vez
+                ds2431_t esclavo_nuevo = { .rom_code = roms[i] };
                 ds2431_data_t datos_leidos;
                 
-                if (ds2431_leer_datos(ds2482, &esclavo_actual, &datos_leidos) == ESP_OK && datos_leidos.valido) {
-                    strncpy(dispositivos[idx].unidad, datos_leidos.unidad, 11);
-                    dispositivos[idx].unidad[11] = '\0';
-                    dispositivos[idx].asignado = true;
-                    ESP_LOGI(TAG, "NUEVA Jaula leída: %s", dispositivos[idx].unidad);
-                } else {
-                    ESP_LOGW(TAG, "No se pudo leer la EEPROM del ROM %s", rom_str);
+                if (ds2431_leer_datos(ds2482, &esclavo_nuevo, &datos_leidos) == ESP_OK && datos_leidos.valido) {
+                    // Buscar el índice y actualizar
+                    for (size_t j = 0; j < num_dispositivos; j++) {
+                        if (dispositivos[j].rom == roms[i]) {
+                            strncpy(dispositivos[j].unidad, datos_leidos.unidad, 11);
+                            dispositivos[j].unidad[11] = '\0';
+                            dispositivos[j].asignado = true;
+                            dispositivos[j].presente = true;
+                            dispositivos[j].ausencias = 0;
+                            break;
+                        }
+                    }
                 }
             }
-        }
-    }
-    
-    // 2. El Verdugo (Debounce): Evaluar quién se desconectó definitivamente
-    for (size_t i = 0; i < num_dispositivos; i++) {
-        if (dispositivos[i].ausencias >= 3) { // Si no la vemos en 3 escaneos seguidos
-            dispositivos[i].presente = false;
         }
     }
 

@@ -183,8 +183,10 @@ esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *foun
                 uint8_t branch_direction = (status & DS2482_STATUS_DIR) ? 1 : 0;
 
                 if (id_bit && cmp_id_bit) {
-                    ESP_LOGE(TAG, "Conflicto no resoluble");
-                    return ESP_FAIL;
+                    ESP_LOGW(TAG, "Límite de bus alcanzado (Conflicto 1,1). Finalizando búsqueda...");
+                    // En lugar de return ESP_FAIL;, usamos un break para salir del bit-loop 
+                    // y permitir que la función devuelva las ROMs encontradas hasta el momento.
+                    break; 
                 }
 
                 if (!id_bit && !cmp_id_bit && search_direction == 0) {
