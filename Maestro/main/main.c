@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -18,6 +19,8 @@
 #include "driver/i2c.h"
 #include "ds2482.h" // header del DS2482 para bridge y comunicación del maestro 1-wire
 #include "ds2431.h" // header del DS2431 para lectura del rom y esclavo 1-wire
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 
 #define TAG "IDJ" // defino el tag del logger y dispositivo
 
@@ -40,6 +43,7 @@ typedef struct {
 
 static dispositivo_t dispositivos[MAX_DEVICES]; // asigno el tamaño del arreglo
 static size_t num_dispositivos = 0; // contador de dispositivos registrados
+static bool nvs_dirty = false;      // se activa cuando hay cambios pendientes de guardar
 
 // normalización de ROM para formato consistente
 void rom_to_string(uint64_t rom, char *output) {
@@ -199,71 +203,80 @@ void agregar_dispositivo(uint64_t rom) {
 
     
 
-    printf("Nuevo dispositivo agregado: %s\n", dispositivos[idx].rom_str);
     ESP_LOGI("IDJ", "Nuevo dispositivo agregado: %s", dispositivos[idx].rom_str);
-
     num_dispositivos++;
-
-    guardar_en_nvs();
+    nvs_dirty = true;
 }
 
 
 
-#define SCAN_INTERVAL_MS 10000 // <-- única variable a modificar (milisegundos)
+#define SCAN_INTERVAL_MS      10000  // intervalo entre ciclos (ms)
+#define AUSENCIAS_PARAR_PING      5  // 5 × 10s = 50s: dejar de gastar bus en Phase 1
+#define AUSENCIAS_EVICTAR        18  // 18 × 10s = ~3min: borrar del registro y NVS
+#define BUS_ERRORES_MAX           5  // reiniciar ESP32 tras 5 errores I2C/1-Wire consecutivos
 
 
-// Función de escaneo extraída del while para mayor claridad
-void escanear_dispositivos(ds2482_t *ds2482) {
-    static uint8_t ciclos_escaneo = 0; // Contador para no hacer Search ROM siempre
+// Función de escaneo. forzar_descubrimiento = true salta el contador de ciclos
+// y ejecuta el Search ROM inmediatamente (se usa al arrancar sin dispositivos).
+void escanear_dispositivos(ds2482_t *ds2482, bool forzar_descubrimiento) {
+    static uint8_t ciclos_escaneo = 0;
     ciclos_escaneo++;
 
     ESP_LOGI(TAG, "--- Iniciando PING a jaulas conocidas ---");
 
     // =================================================================
-    // FASE 1: "PING" LIVIANO A JAULAS CONOCIDAS (Se hace SIEMPRE)
+    // FASE 1: PING LIVIANO A JAULAS CONOCIDAS (Se hace SIEMPRE)
+    // Match ROM + Read Memory 4 bytes — mínimo indispensable en bus.
     // =================================================================
     for (size_t i = 0; i < num_dispositivos; i++) {
-        if (dispositivos[i].asignado) {
+        if (dispositivos[i].asignado && dispositivos[i].ausencias < AUSENCIAS_PARAR_PING) {
             ds2431_t esclavo_conocido = { .rom_code = dispositivos[i].rom };
-            uint8_t buffer[4]; // Solo leemos 4 bytes (Magic ID y Num Jaula)
+            uint8_t buffer[4];
 
-            // Intentar leer la memoria directamente (sin Search ROM)
             esp_err_t err_ping = ds2431_read_memory(ds2482, &esclavo_conocido, 0x00, buffer, 4);
 
             if (err_ping == ESP_OK && buffer[0] == DS2431_MAGIC_BYTE0 && buffer[1] == DS2431_MAGIC_BYTE1) {
-                // ¡El esclavo respondió! 
                 dispositivos[i].presente = true;
                 dispositivos[i].ausencias = 0;
-                
-                // Actualizar el número de jaula por si lo reprogramaron en otro lado
+
+                // Detectar si fue reprogramado por el Programador entre ciclos
                 uint16_t num_jaula = (uint16_t)buffer[2] | ((uint16_t)buffer[3] << 8);
-                generar_unidad(num_jaula, dispositivos[i].unidad);
+                char nueva_unidad[12];
+                generar_unidad(num_jaula, nueva_unidad);
+                if (strcmp(dispositivos[i].unidad, nueva_unidad) != 0) {
+                    strncpy(dispositivos[i].unidad, nueva_unidad, 11);
+                    dispositivos[i].unidad[11] = '\0';
+                    nvs_dirty = true;
+                    ESP_LOGW(TAG, "Unidad reprogramada: %s ahora es %s", dispositivos[i].rom_str, nueva_unidad);
+                }
 
                 ESP_LOGI(TAG, "PING OK: %s sigue conectada.", dispositivos[i].unidad);
             } else {
-                // Falló el ping, penalizamos
                 if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
                 if (dispositivos[i].ausencias >= 3) dispositivos[i].presente = false;
-                ESP_LOGW(TAG, "PING FALLIDO: Jaula historial ROM %s no responde.", dispositivos[i].rom_str);
+                ESP_LOGW(TAG, "PING FALLIDO: ROM %s no responde.", dispositivos[i].rom_str);
             }
         }
     }
 
     // =================================================================
-    // FASE 2: DESCUBRIMIENTO PESADO (Solo 1 de cada 6 veces, ej. cada 60s)
+    // FASE 2: DESCUBRIMIENTO (cada 3 ciclos = 30s, o forzado)
+    // Se reduce de 6 a 3 para detectar esclavos nuevos más rápido.
+    // forzar_descubrimiento se activa cuando no hay ningún dispositivo
+    // registrado — así el primer esclavo conectado se detecta al instante.
     // =================================================================
-    if (ciclos_escaneo >= 6) {
+    if (forzar_descubrimiento || ciclos_escaneo >= 3) {
         ciclos_escaneo = 0;
         ESP_LOGI(TAG, "--- Iniciando DESCUBRIMIENTO de nuevas jaulas ---");
-        
+
         uint64_t roms[MAX_DEVICES];
         size_t found = 0;
-        
+
         esp_err_t err = ds2482_search_rom_all(roms, MAX_DEVICES, &found);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Search ROM reportó un error o límite de bus. Jaulas encontradas: %zu", found);
+            ESP_LOGW(TAG, "Search ROM reportó error. Jaulas encontradas: %zu", found);
         }
-        
+
         for (size_t i = 0; i < found; i++) {
             if (!rom_es_ds2431(roms[i])) continue;
 
@@ -271,15 +284,14 @@ void escanear_dispositivos(ds2482_t *ds2482) {
             rom_to_string(roms[i], rom_str);
 
             if (!existe_dispositivo_str(rom_str)) {
-                ESP_LOGI(TAG, "¡NUEVA JAULA FÍSICA DETECTADA! ROM: %s", rom_str);
+                // ── Dispositivo nuevo: agregar y leer EEPROM ──
+                ESP_LOGI(TAG, "NUEVA JAULA DETECTADA! ROM: %s", rom_str);
                 agregar_dispositivo(roms[i]);
-                
-                // Leer la memoria completa solo la primera vez
+
                 ds2431_t esclavo_nuevo = { .rom_code = roms[i] };
                 ds2431_data_t datos_leidos;
-                
+
                 if (ds2431_leer_datos(ds2482, &esclavo_nuevo, &datos_leidos) == ESP_OK && datos_leidos.valido) {
-                    // Buscar el índice y actualizar
                     for (size_t j = 0; j < num_dispositivos; j++) {
                         if (dispositivos[j].rom == roms[i]) {
                             strncpy(dispositivos[j].unidad, datos_leidos.unidad, 11);
@@ -291,11 +303,59 @@ void escanear_dispositivos(ds2482_t *ds2482) {
                         }
                     }
                 }
+            } else {
+                // ── Dispositivo ya conocido ──
+                for (size_t j = 0; j < num_dispositivos; j++) {
+                    if (dispositivos[j].rom != roms[i]) continue;
+
+                    if (!dispositivos[j].asignado) {
+                        // Re-leer EEPROM por si el Programador lo grabó entre ciclos
+                        ds2431_t esclavo = { .rom_code = roms[i] };
+                        ds2431_data_t datos;
+                        if (ds2431_leer_datos(ds2482, &esclavo, &datos) == ESP_OK && datos.valido) {
+                            strncpy(dispositivos[j].unidad, datos.unidad, 11);
+                            dispositivos[j].unidad[11] = '\0';
+                            dispositivos[j].asignado = true;
+                            dispositivos[j].presente = true;
+                            dispositivos[j].ausencias = 0;
+                            nvs_dirty = true;
+                            ESP_LOGI(TAG, "Esclavo asignado: %s → %s", rom_str, datos.unidad);
+                        }
+                    } else if (dispositivos[j].ausencias > 0) {
+                        // Estaba marcado ausente pero el Search ROM lo encontró: reconectado
+                        dispositivos[j].presente = true;
+                        dispositivos[j].ausencias = 0;
+                        ESP_LOGI(TAG, "Jaula reconectada: %s", dispositivos[j].unidad);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // ── Evictar dispositivos ausentes demasiado tiempo ──
+        // Se borran del array y de NVS. Si vuelven a conectarse en
+        // otro viaje, Phase 2 los re-agrega leyendo la EEPROM de nuevo.
+        size_t j = 0;
+        while (j < num_dispositivos) {
+            if (dispositivos[j].ausencias >= AUSENCIAS_EVICTAR) {
+                ESP_LOGW(TAG, "Descartando jaula ausente: %s (%s)",
+                         dispositivos[j].unidad[0] ? dispositivos[j].unidad : "SIN_ASIGNAR",
+                         dispositivos[j].rom_str);
+                memmove(&dispositivos[j], &dispositivos[j + 1],
+                        (num_dispositivos - j - 1) * sizeof(dispositivo_t));
+                num_dispositivos--;
+                nvs_dirty = true;
+            } else {
+                j++;
             }
         }
     }
 
-    guardar_en_nvs();
+    // Guardar en flash solo si hubo cambios reales
+    if (nvs_dirty) {
+        guardar_en_nvs();
+        nvs_dirty = false;
+    }
 }
 
 // ============================================================
@@ -340,23 +400,48 @@ void app_main(void) {
         // pero con mayor riesgo de errores en distancias largas
     }
 
+    // Watchdog: reinicia el ESP32 si el bus se traba y no alimentamos el WDT en 30s.
+    // Cubre el caso donde ds2482_busy_wait() se cuelga por I2C frozen o hardware fault.
+    esp_task_wdt_config_t wdt_cfg = {
+        .timeout_ms    = 30000,   // 30s — cubre un ciclo de escaneo completo con margen
+        .idle_core_mask = 0,
+        .trigger_panic  = true,   // genera coredump + reset automático
+    };
+    if (esp_task_wdt_reconfigure(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(esp_task_wdt_init(&wdt_cfg));
+    }
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+    ESP_LOGI(TAG, "Task WDT activo: timeout 30s");
+
+    uint8_t errores_bus = 0;
+
 while (1) {
+        esp_task_wdt_reset();   // alimentar watchdog: si no llegamos aquí en 30s → reset
+
         bool presence = false;
         err = ds2482_1wire_reset(&presence);
 
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Error en reset 1-Wire");
-        } else if (!presence) {
-            ESP_LOGW(TAG, "Bus vacío — ninguna jaula conectada");
-            // Si el bus está vacío, castigamos a todas las jaulas conocidas
-            for (size_t i = 0; i < num_dispositivos; i++) {
-                dispositivos[i].ausencias++;
-                if (dispositivos[i].ausencias >= 3) {
-                    dispositivos[i].presente = false;
-                }
+            errores_bus++;
+            ESP_LOGE(TAG, "Error en reset 1-Wire [%d/%d]", errores_bus, BUS_ERRORES_MAX);
+            if (errores_bus >= BUS_ERRORES_MAX) {
+                ESP_LOGE(TAG, "Bus 1-Wire irrecuperable — reiniciando ESP32...");
+                esp_restart();
             }
         } else {
-            escanear_dispositivos(&ds2482);
+            errores_bus = 0;    // I2C + DS2482 respondieron: limpiar contador
+            if (!presence) {
+                ESP_LOGW(TAG, "Bus vacío — ninguna jaula conectada");
+                for (size_t i = 0; i < num_dispositivos; i++) {
+                    if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
+                    if (dispositivos[i].ausencias >= 3) {
+                        dispositivos[i].presente = false;
+                    }
+                }
+            } else {
+                bool forzar = (num_dispositivos == 0);
+                escanear_dispositivos(&ds2482, forzar);
+            }
         }
 
         // ====================================================

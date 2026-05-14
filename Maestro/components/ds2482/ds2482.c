@@ -49,10 +49,15 @@ esp_err_t ds2482_read_register(uint8_t *value) {
 
 esp_err_t ds2482_busy_wait() {
     uint8_t status;
+    int intentos = 0;
     do {
         ds2482_set_read_pointer(DS2482_REG_STATUS);
         ds2482_read_register(&status);
         vTaskDelay(pdMS_TO_TICKS(1));
+        if (++intentos >= 500) {
+            ESP_LOGE(TAG, "busy_wait timeout — bus 1-Wire bloqueado");
+            return ESP_ERR_TIMEOUT;
+        }
     } while (status & DS2482_STATUS_BUSY);
     return ESP_OK;
 }
@@ -161,6 +166,7 @@ esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *foun
 
         ESP_ERROR_CHECK(ds2482_write_byte(0xF0)); // Search ROM
 
+        bool conflict = false;
         for (int byte = 0; byte < 8; byte++) {
             uint8_t byte_val = 0;
 
@@ -183,10 +189,9 @@ esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *foun
                 uint8_t branch_direction = (status & DS2482_STATUS_DIR) ? 1 : 0;
 
                 if (id_bit && cmp_id_bit) {
-                    ESP_LOGW(TAG, "Límite de bus alcanzado (Conflicto 1,1). Finalizando búsqueda...");
-                    // En lugar de return ESP_FAIL;, usamos un break para salir del bit-loop 
-                    // y permitir que la función devuelva las ROMs encontradas hasta el momento.
-                    break; 
+                    ESP_LOGW(TAG, "Conflicto 1,1 en bit %d — deteniendo búsqueda", bit_number);
+                    conflict = true;
+                    break;
                 }
 
                 if (!id_bit && !cmp_id_bit && search_direction == 0) {
@@ -196,17 +201,22 @@ esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *foun
                 byte_val |= (branch_direction << bit);
             }
 
+            if (conflict) break;   // sale también del loop de bytes
             rom |= ((uint64_t)byte_val << (byte * 8));
         }
 
-        roms[*found] = rom;
-        (*found)++;
-
-        if (current_discrepancy == 0) {
-            last_device_flag = 1;
+        if (conflict) {
+            last_device_flag = 1;  // no agregar ROM corrupto, detener búsqueda
         } else {
-            last_discrepancy = current_discrepancy;
-            last_rom = rom;
+            roms[*found] = rom;
+            (*found)++;
+
+            if (current_discrepancy == 0) {
+                last_device_flag = 1;
+            } else {
+                last_discrepancy = current_discrepancy;
+                last_rom = rom;
+            }
         }
     }
 
