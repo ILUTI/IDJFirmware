@@ -322,10 +322,36 @@ void escanear_dispositivos(ds2482_t *ds2482, bool forzar_descubrimiento) {
                             ESP_LOGI(TAG, "Esclavo asignado: %s → %s", rom_str, datos.unidad);
                         }
                     } else if (dispositivos[j].ausencias > 0) {
-                        // Estaba marcado ausente pero el Search ROM lo encontró: reconectado
+                        // Estaba marcado ausente pero el Search ROM lo encontró: reconectado.
+                        // Re-leer EEPROM para capturar reprogramación ocurrida durante la ausencia.
+                        ds2431_t esclavo_rc = { .rom_code = roms[i] };
+                        ds2431_data_t datos_rc;
+                        if (ds2431_leer_datos(ds2482, &esclavo_rc, &datos_rc) == ESP_OK && datos_rc.valido) {
+                            if (strcmp(dispositivos[j].unidad, datos_rc.unidad) != 0) {
+                                strncpy(dispositivos[j].unidad, datos_rc.unidad, 11);
+                                dispositivos[j].unidad[11] = '\0';
+                                nvs_dirty = true;
+                                ESP_LOGW(TAG, "Reprogramación al reconectar: %s → %s",
+                                         dispositivos[j].rom_str, datos_rc.unidad);
+                            }
+                        }
                         dispositivos[j].presente = true;
                         dispositivos[j].ausencias = 0;
                         ESP_LOGI(TAG, "Jaula reconectada: %s", dispositivos[j].unidad);
+                    } else {
+                        // Asignada y siempre presente: verificar reprogramación cada ~30s (Phase 2).
+                        // No se hace en Phase 1 para no saturar el bus en cada ciclo de 10s.
+                        ds2431_t esclavo_chk = { .rom_code = roms[i] };
+                        ds2431_data_t datos_chk;
+                        if (ds2431_leer_datos(ds2482, &esclavo_chk, &datos_chk) == ESP_OK && datos_chk.valido) {
+                            if (strcmp(dispositivos[j].unidad, datos_chk.unidad) != 0) {
+                                ESP_LOGW(TAG, "Reprogramación detectada (Phase 2): %s → %s",
+                                         dispositivos[j].rom_str, datos_chk.unidad);
+                                strncpy(dispositivos[j].unidad, datos_chk.unidad, 11);
+                                dispositivos[j].unidad[11] = '\0';
+                                nvs_dirty = true;
+                            }
+                        }
                     }
                     break;
                 }
