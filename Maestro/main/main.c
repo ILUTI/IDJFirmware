@@ -208,13 +208,10 @@ void agregar_dispositivo(uint64_t rom) {
     nvs_dirty = true;
 }
 
-
-
 #define SCAN_INTERVAL_MS      10000  // intervalo entre ciclos (ms)
 #define AUSENCIAS_PARAR_PING      5  // 5 × 10s = 50s: dejar de gastar bus en Phase 1
 #define AUSENCIAS_EVICTAR        18  // 18 × 10s = ~3min: borrar del registro y NVS
 #define BUS_ERRORES_MAX           5  // reiniciar ESP32 tras 5 errores I2C/1-Wire consecutivos
-
 
 // Función de escaneo. forzar_descubrimiento = true salta el contador de ciclos
 // y ejecuta el Search ROM inmediatamente (se usa al arrancar sin dispositivos).
@@ -229,6 +226,7 @@ void escanear_dispositivos(ds2482_t *ds2482, bool forzar_descubrimiento) {
     // Match ROM + Read Memory 4 bytes — mínimo indispensable en bus.
     // =================================================================
     for (size_t i = 0; i < num_dispositivos; i++) {
+        esp_task_wdt_reset(); // scan largo con retries puede acercarse al timeout de 30s
         if (dispositivos[i].asignado && dispositivos[i].ausencias < AUSENCIAS_PARAR_PING) {
             ds2431_t esclavo_conocido = { .rom_code = dispositivos[i].rom };
             uint8_t buffer[4];
@@ -256,6 +254,9 @@ void escanear_dispositivos(ds2482_t *ds2482, bool forzar_descubrimiento) {
                 if (dispositivos[i].ausencias >= 3) dispositivos[i].presente = false;
                 ESP_LOGW(TAG, "PING FALLIDO: ROM %s no responde.", dispositivos[i].rom_str);
             }
+            // Pausa entre pings: 50ms para bus de 80m (~4-8nF).
+            // El bus debe llegar a Vcc estable antes del siguiente reset.
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
 
@@ -267,6 +268,7 @@ void escanear_dispositivos(ds2482_t *ds2482, bool forzar_descubrimiento) {
     // =================================================================
     if (forzar_descubrimiento || ciclos_escaneo >= 3) {
         ciclos_escaneo = 0;
+        esp_task_wdt_reset(); // Fase 2 puede tomar varios segundos con retries
         ESP_LOGI(TAG, "--- Iniciando DESCUBRIMIENTO de nuevas jaulas ---");
 
         uint64_t roms[MAX_DEVICES];
@@ -358,6 +360,22 @@ void escanear_dispositivos(ds2482_t *ds2482, bool forzar_descubrimiento) {
             }
         }
 
+        // ── Incrementar ausencias de dispositivos que Fase 2 tampoco encontró ──
+        // Cubre el caso donde Fase 1 los saltó (ausencias >= AUSENCIAS_PARAR_PING)
+        // y Search ROM tampoco los detecta: sin este bloque, ausencias se congela
+        // en AUSENCIAS_PARAR_PING y el dispositivo fantasma nunca es evictado.
+        for (size_t i = 0; i < num_dispositivos; i++) {
+            if (dispositivos[i].ausencias < AUSENCIAS_PARAR_PING) continue; // Fase 1 ya lo manejó
+            bool encontrado = false;
+            for (size_t k = 0; k < found; k++) {
+                if (dispositivos[i].rom == roms[k]) { encontrado = true; break; }
+            }
+            if (!encontrado) {
+                if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
+                if (dispositivos[i].ausencias >= 3) dispositivos[i].presente = false;
+            }
+        }
+
         // ── Evictar dispositivos ausentes demasiado tiempo ──
         // Se borran del array y de NVS. Si vuelven a conectarse en
         // otro viaje, Phase 2 los re-agrega leyendo la EEPROM de nuevo.
@@ -412,8 +430,9 @@ void app_main(void) {
     ds2482_t ds2482;
     esp_err_t err = ds2482_init(&ds2482, I2C_MASTER_NUM, DS2482_I2C_ADDR);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "DS2482 no detectado en bus I2C");
-        return;
+        ESP_LOGE(TAG, "DS2482 no detectado en bus I2C — reiniciando en 5s");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
     }
     ESP_LOGI(TAG, "DS2482 inicializado correctamente");
 
@@ -440,6 +459,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "Task WDT activo: timeout 30s");
 
     uint8_t errores_bus = 0;
+    bool bus_estuvo_vacio = false;
 
 while (1) {
         esp_task_wdt_reset();   // alimentar watchdog: si no llegamos aquí en 30s → reset
@@ -457,6 +477,7 @@ while (1) {
         } else {
             errores_bus = 0;    // I2C + DS2482 respondieron: limpiar contador
             if (!presence) {
+                bus_estuvo_vacio = true;
                 ESP_LOGW(TAG, "Bus vacío — ninguna jaula conectada");
                 for (size_t i = 0; i < num_dispositivos; i++) {
                     if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
@@ -465,7 +486,10 @@ while (1) {
                     }
                 }
             } else {
-                bool forzar = (num_dispositivos == 0);
+                // Forzar Search ROM si: no hay dispositivos registrados,
+                // o el bus estuvo vacío (reconexión) — para redescubrir de inmediato.
+                bool forzar = (num_dispositivos == 0) || bus_estuvo_vacio;
+                bus_estuvo_vacio = false;
                 escanear_dispositivos(&ds2482, forzar);
             }
         }
@@ -519,20 +543,18 @@ while (1) {
                 }
             }
 
-            // Convertimos el JSON a string
             char *json_string = cJSON_PrintUnformatted(json);
-            //if (json_string != NULL) {
-                // Publicar al tópico.
+            if (json_string != NULL) {
                 int msg_id = esp_mqtt_client_publish(mqtt_client, "GIO/IDJ", json_string, 0, 0, 0);
-                
                 if (msg_id != -1) {
                     ESP_LOGI(TAG, "MQTT Publicado OK: %s", json_string);
                 } else {
                     ESP_LOGE(TAG, "Error al publicar en MQTT");
                 }
-                
                 free(json_string);
-            //}
+            } else {
+                ESP_LOGE(TAG, "cJSON_PrintUnformatted falló — sin memoria");
+            }
             cJSON_Delete(json);
         } else {
             ESP_LOGE(TAG, "Fallo al crear el objeto JSON para MQTT");
