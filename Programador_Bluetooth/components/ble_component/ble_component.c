@@ -3,38 +3,55 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
-// Referencia a la cola que crearemos en el main
+// Cola declarada en main_programador.c
 extern QueueHandle_t cola_programacion_jaula;
 
+// ── Variables compartidas con main_programador.c ──────────────────────────────
+volatile uint16_t ble_pending_dolly = 0;   // Dolly pendiente de programar
+volatile bool     ble_cmd_leer      = false; // Flag: ejecutar lectura de EEPROM
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Adv configuration signal
-static uint8_t adv_config_done=0;
-
-// DEVICE UUID TABLE ARRAY
+static uint8_t adv_config_done = 0;
 static uint16_t device_handle_table[DEVICE_IDX_NB];
 
-// ---> VARIABLES PARA RECORDAR LA CONEXIÓN BLE <---
-uint16_t ble_gatts_if = ESP_GATT_IF_NONE;
-uint16_t ble_conn_id = 0xffff;
-bool ble_is_connected = false;
+// Variables de conexión BLE
+uint16_t ble_gatts_if  = ESP_GATT_IF_NONE;
+uint16_t ble_conn_id   = 0xffff;
+bool     ble_is_connected = false;
 
-// Service UUID
+// ── UUIDs ─────────────────────────────────────────────────────────────────────
 static uint8_t service_uuid[16] = {
-    /* LSB <--------------------------------------------------------------------------------> MSB */
-    //first uuid, 16bit, [12],[13] is the value
-    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+    0x00, 0x10, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
 };
 
-// Adv data
+static const uint16_t GATTS_SERVICE_UUID        = 0xFF00;
+static const uint16_t GATTS_CHAR_UUID_ID        = 0xFF0A;
+static const uint16_t GATTS_CHAR_UUID_WIFI_SSID = 0xA0B2;
+static const uint16_t GATTS_CHAR_UUID_WIFI_PSWD = 0xA0B3;
+static const uint16_t GATTS_CHAR_UUID_JAULA      = 0xA0B4;
+static const uint16_t GATTS_CHAR_UUID_DOLLY      = 0xA0B6;  // NUEVO
+static const uint16_t GATTS_CHAR_UUID_STATUS     = 0xA0B5;
+
+// ── Propiedades de características ───────────────────────────────────────────
+static const uint16_t primary_service_uuid         = ESP_GATT_UUID_PRI_SERVICE;
+static const uint16_t character_declaration_uuid   = ESP_GATT_UUID_CHAR_DECLARE;
+static const uint8_t  char_prop_read_write         = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ;
+static const uint16_t character_client_config_uuid = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+static const uint8_t  char_prop_read_notify        = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+static const uint8_t  notification_ccc[2]          = {0x01, 0x00};
+static const uint8_t  char_value[4]                = {0x11, 0x22, 0x33, 0x44};
+
+// ── Datos de advertising ──────────────────────────────────────────────────────
 static esp_ble_adv_data_t adv_data = {
     .set_scan_rsp        = false,
     .include_name        = true,
     .include_txpower     = true,
-    .min_interval        = 0x0006, //slave connection min interval, Time = min_interval * 1.25 msec
-    .max_interval        = 0x0010, //slave connection max interval, Time = max_interval * 1.25 msec
+    .min_interval        = 0x0006,
+    .max_interval        = 0x0010,
     .appearance          = 0x00,
-    .manufacturer_len    = 0,    //TEST_MANUFACTURER_DATA_LEN,
-    .p_manufacturer_data = NULL, //test_manufacturer,
+    .manufacturer_len    = 0,
+    .p_manufacturer_data = NULL,
     .service_data_len    = 0,
     .p_service_data      = NULL,
     .service_uuid_len    = sizeof(service_uuid),
@@ -42,7 +59,6 @@ static esp_ble_adv_data_t adv_data = {
     .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
 };
 
-// Scan response data
 static esp_ble_adv_data_t scan_rsp_data = {
     .set_scan_rsp        = true,
     .include_name        = true,
@@ -50,8 +66,8 @@ static esp_ble_adv_data_t scan_rsp_data = {
     .min_interval        = 0x0006,
     .max_interval        = 0x0010,
     .appearance          = 0x00,
-    .manufacturer_len    = 0, //TEST_MANUFACTURER_DATA_LEN,
-    .p_manufacturer_data = NULL, //&test_manufacturer[0],
+    .manufacturer_len    = 0,
+    .p_manufacturer_data = NULL,
     .service_data_len    = 0,
     .p_service_data      = NULL,
     .service_uuid_len    = sizeof(service_uuid),
@@ -59,565 +75,447 @@ static esp_ble_adv_data_t scan_rsp_data = {
     .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
 };
 
-// Adv parameters
 static esp_ble_adv_params_t adv_params = {
-    .adv_int_min         = 0x20,
-    .adv_int_max         = 0x40,
-    .adv_type            = ADV_TYPE_IND,
-    .own_addr_type       = BLE_ADDR_TYPE_PUBLIC,
-    .channel_map         = ADV_CHNL_ALL,
-    .adv_filter_policy   = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    .adv_int_min       = 0x20,
+    .adv_int_max       = 0x40,
+    .adv_type          = ADV_TYPE_IND,
+    .own_addr_type     = BLE_ADDR_TYPE_PUBLIC,
+    .channel_map       = ADV_CHNL_ALL,
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
-// GATT Profile Instance
+// ── Perfil GATT ───────────────────────────────────────────────────────────────
 struct gatts_profile_inst {
-    esp_gatts_cb_t gatts_cb;
-    uint16_t gatts_if;
-    uint16_t app_id;
-    uint16_t conn_id;
-    uint16_t service_handle;
+    esp_gatts_cb_t   gatts_cb;
+    uint16_t         gatts_if;
+    uint16_t         app_id;
+    uint16_t         conn_id;
+    uint16_t         service_handle;
     esp_gatt_srvc_id_t service_id;
-    uint16_t char_handle;
-    esp_bt_uuid_t char_uuid;
-    esp_gatt_perm_t perm;
+    uint16_t         char_handle;
+    esp_bt_uuid_t    char_uuid;
+    esp_gatt_perm_t  perm;
     esp_gatt_char_prop_t property;
-    uint16_t descr_handle;
-    esp_bt_uuid_t descr_uuid;
+    uint16_t         descr_handle;
+    esp_bt_uuid_t    descr_uuid;
 };
 
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
-					esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+                                        esp_gatt_if_t gatts_if,
+                                        esp_ble_gatts_cb_param_t *param);
 
-/* One gatt-based profile one app_id and one gatts_if, this array will store the gatts_if returned by ESP_GATTS_REG_EVT */
 static struct gatts_profile_inst device_profile_tab[PROFILE_NUM] = {
     [PROFILE_APP_IDX] = {
-        .gatts_cb = gatts_profile_event_handler,
-        .gatts_if = ESP_GATT_IF_NONE,       /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
+        .gatts_cb  = gatts_profile_event_handler,
+        .gatts_if  = ESP_GATT_IF_NONE,
     },
 };
 
-
-/* Service */
-static const uint16_t GATTS_SERVICE_UUID            = 0xFF00;   //Lookup for UUID generators
-static const uint16_t GATTS_CHAR_UUID_ID        = 0xFF0A;   //Lookup for UUID generators
-static const uint16_t GATTS_CHAR_UUID_WIFI_SSID     = 0xA0B2;   //Lookup for UUID generators
-static const uint16_t GATTS_CHAR_UUID_WIFI_PSWD     = 0xA0B3;   //Lookup for UUID generators
-static const uint16_t GATTS_CHAR_UUID_JAULA         = 0xA0B4;
-static const uint16_t GATTS_CHAR_UUID_STATUS = 0xA0B5; // Nueva dirección
-
-static const uint16_t primary_service_uuid         = ESP_GATT_UUID_PRI_SERVICE;
-static const uint16_t character_declaration_uuid   = ESP_GATT_UUID_CHAR_DECLARE;
-//static const uint8_t char_prop_write               = ESP_GATT_CHAR_PROP_BIT_WRITE;
-//static const uint8_t char_prop_read                = ESP_GATT_CHAR_PROP_BIT_READ;
-static const uint8_t char_prop_read_write          = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ;
-static const uint16_t character_client_config_uuid = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
-static const uint8_t char_prop_read_notify = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
-static const uint8_t notification_ccc[2] = {0x01, 0x00}; // Activa notificaciones
-static const uint8_t char_value[4]                 = {0x11, 0x22, 0x33, 0x44};
-
-
-/* Full Database Description - Used to add attributes into the database */
+// ── Tabla de atributos GATT ───────────────────────────────────────────────────
 static const esp_gatts_attr_db_t gatt_db[DEVICE_IDX_NB] =
 {
-    // Service Declaration
-    [DEVICE_SVC]        =
+    // Declaración de servicio
+    [DEVICE_SVC] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&primary_service_uuid, ESP_GATT_PERM_READ,
       sizeof(uint16_t), sizeof(GATTS_SERVICE_UUID), (uint8_t *)&GATTS_SERVICE_UUID}},
 
-    /* Characteristic Declaration  ID*/
-    [DEVICE_CHAR_ID]      =
+    // ID del dispositivo (Read/Write)
+    [DEVICE_CHAR_ID] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
       CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_write}},
-
-    /* Characteristic Value  ID*/
-    [DEVICE_CHAR_VAL_ID]  =
+    [DEVICE_CHAR_VAL_ID] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_ID, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
       GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
 
-    /* Characteristic Declaration SSID*/
-    [DEVICE_CHAR_WIFI_SSID]      =
+    // WiFi SSID (Read/Write)
+    [DEVICE_CHAR_WIFI_SSID] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
       CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_write}},
-
-    /* Characteristic Value  SSID*/
-    [DEVICE_CHAR_VAL_WIFI_SSID]  =
+    [DEVICE_CHAR_VAL_WIFI_SSID] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_WIFI_SSID, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
       GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
 
-    /* Characteristic Declaration  PSWD*/
-    [DEVICE_CHAR_WIFI_PSWD]      =
+    // WiFi Password (Read/Write)
+    [DEVICE_CHAR_WIFI_PSWD] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
       CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_write}},
-
-    /* Characteristic Value  PSWD*/
-    [DEVICE_CHAR_VAL_WIFI_PSWD]  =
+    [DEVICE_CHAR_VAL_WIFI_PSWD] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_WIFI_PSWD, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
       GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
 
-    /* Characteristic Declaration NÚMERO DE JAULA */
+    // Número de Jaula 0xA0B4 (Write = programa | Write "READ" = lee EEPROM)
     [DEVICE_CHAR_JAULA] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
       CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_write}},
-
-    /* Characteristic Value NÚMERO DE JAULA */
     [DEVICE_CHAR_VAL_JAULA] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_JAULA, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
       GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
 
+    // Número de Dolly 0xA0B6 — NUEVO (Write = guarda pendiente, "0" o "NONE" = sin dolly)
+    [DEVICE_CHAR_DOLLY] =
+    {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
+      CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_write}},
+    [DEVICE_CHAR_VAL_DOLLY] =
+    {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_DOLLY, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+      GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
+
+    // Canal de respuesta 0xA0B5 (Read + Notify)
     [DEVICE_CHAR_STATUS] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
-    CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_notify}},
-
+      CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_notify}},
     [DEVICE_CHAR_VAL_STATUS] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_STATUS, ESP_GATT_PERM_READ,
-    GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
-
-    [DEVICE_CHAR_CFG_STATUS] = // Este permite que el celular se "suscriba" a los mensajes
+      GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
+    [DEVICE_CHAR_CFG_STATUS] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
-    sizeof(notification_ccc), sizeof(notification_ccc), (uint8_t *)notification_ccc}},
-
-
-      
+      sizeof(notification_ccc), sizeof(notification_ccc), (uint8_t *)notification_ccc}},
 };
 
-/// @brief Read event handler for specifi UUID
-/// @param gatts_if  GATT interface type
-/// @param param GATT server callback parameters
+// ── Read event handler ────────────────────────────────────────────────────────
 static void handle_read_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
-        esp_gatt_rsp_t rsp = {0};
-        esp_err_t err;
-        char value[16];
-        switch (param->read.handle - 40)
-        {
-        case DEVICE_CHAR_VAL_ID:
-            ESP_LOGI(BLE_TAG,"READING ID VALUE");
-           //Create DEVICE Unique ID, base of the MAC ADDR
-            uint8_t mac[6];
-            esp_read_mac(mac, ESP_MAC_WIFI_STA);
-            sprintf(value, "%s-%02X%02X", CONFIG_DEVICE_NAME, mac[4], mac[5]);
-            rsp.attr_value.handle = param->read.handle;
-            rsp.attr_value.len = sizeof(value);
-            memcpy(rsp.attr_value.value, value, sizeof(value));
-            esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
-            break;
-        case DEVICE_CHAR_VAL_WIFI_SSID:
-            ESP_LOGI(BLE_TAG,"READING WIFI SSID");
-            err = read_str_nvs("wifi_ssid", value, sizeof(value));
-            if (err != ESP_OK){
-                ESP_LOGE(BLE_TAG, "SOMETHING GO WRONG READING SSID FROM NVS");
-                break;
-            }
-            rsp.attr_value.handle = param->read.handle;
-            rsp.attr_value.len = sizeof(value);
-            memcpy(rsp.attr_value.value, value, sizeof(value));
-            esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
-            break;
-        case DEVICE_CHAR_VAL_WIFI_PSWD:
-            ESP_LOGI(BLE_TAG,"READING WIFI PASSWORD");
-            err = read_str_nvs("wifi_pswd", value, sizeof(value));
-            if (err != ESP_OK){
-                ESP_LOGE(BLE_TAG, "SOMETHING GO WRONG READING PASSWORD FROM NVS");
-                break;
-            }
-            rsp.attr_value.handle = param->read.handle;
-            rsp.attr_value.len = sizeof(value);
-            memcpy(rsp.attr_value.value, value, sizeof(value));
-            esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
-            break;
-        case DEVICE_CHAR_VAL_JAULA:
-            ESP_LOGI(BLE_TAG, "COMANDO BLE: Programar Jaula recibido");
-            
-            // Convertir el texto recibido (ej. "45") a entero
-            uint16_t num_jaula = (uint16_t)atoi(value); 
-            
-            if (num_jaula >= 1 && num_jaula <= 250) {
-                // Enviar el número a la tarea principal a través de la cola
-                if (cola_programacion_jaula != NULL) {
-                    xQueueSend(cola_programacion_jaula, &num_jaula, 0);
-                    ESP_LOGI(BLE_TAG, "Número %d enviado a la cola de programación", num_jaula);
-                }
-            } else {
-                ESP_LOGE(BLE_TAG, "Número inválido. Debe estar entre 1 y 250.");
-            }
-            break;
-        default:
-            break;
-        }
-    
+    esp_gatt_rsp_t rsp = {0};
+    esp_err_t err;
+    char value[16];
+
+    switch (param->read.handle - 40)
+    {
+    case DEVICE_CHAR_VAL_ID:
+        ESP_LOGI(BLE_TAG, "READ: ID");
+        uint8_t mac[6];
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        sprintf(value, "%s-%02X%02X", CONFIG_DEVICE_NAME, mac[4], mac[5]);
+        rsp.attr_value.handle = param->read.handle;
+        rsp.attr_value.len    = strlen(value);
+        memcpy(rsp.attr_value.value, value, rsp.attr_value.len);
+        esp_ble_gatts_send_response(gatts_if, param->read.conn_id,
+                                    param->read.trans_id, ESP_GATT_OK, &rsp);
+        break;
+
+    case DEVICE_CHAR_VAL_WIFI_SSID:
+        ESP_LOGI(BLE_TAG, "READ: WiFi SSID");
+        err = read_str_nvs("wifi_ssid", value, sizeof(value));
+        if (err != ESP_OK) { ESP_LOGE(BLE_TAG, "Error leyendo SSID de NVS"); break; }
+        rsp.attr_value.handle = param->read.handle;
+        rsp.attr_value.len    = strlen(value);
+        memcpy(rsp.attr_value.value, value, rsp.attr_value.len);
+        esp_ble_gatts_send_response(gatts_if, param->read.conn_id,
+                                    param->read.trans_id, ESP_GATT_OK, &rsp);
+        break;
+
+    case DEVICE_CHAR_VAL_WIFI_PSWD:
+        ESP_LOGI(BLE_TAG, "READ: WiFi PSWD");
+        err = read_str_nvs("wifi_pswd", value, sizeof(value));
+        if (err != ESP_OK) { ESP_LOGE(BLE_TAG, "Error leyendo PSWD de NVS"); break; }
+        rsp.attr_value.handle = param->read.handle;
+        rsp.attr_value.len    = strlen(value);
+        memcpy(rsp.attr_value.value, value, rsp.attr_value.len);
+        esp_ble_gatts_send_response(gatts_if, param->read.conn_id,
+                                    param->read.trans_id, ESP_GATT_OK, &rsp);
+        break;
+
+    case DEVICE_CHAR_VAL_DOLLY: {
+        // Devuelve el dolly pendiente como texto (ej. "45" o "0")
+        char dolly_str[8];
+        snprintf(dolly_str, sizeof(dolly_str), "%d", (int)ble_pending_dolly);
+        rsp.attr_value.handle = param->read.handle;
+        rsp.attr_value.len    = strlen(dolly_str);
+        memcpy(rsp.attr_value.value, dolly_str, rsp.attr_value.len);
+        esp_ble_gatts_send_response(gatts_if, param->read.conn_id,
+                                    param->read.trans_id, ESP_GATT_OK, &rsp);
+        break;
+    }
+
+    default:
+        rsp.attr_value.handle  = param->read.handle;
+        rsp.attr_value.len     = 1;
+        rsp.attr_value.value[0] = 0;
+        esp_ble_gatts_send_response(gatts_if, param->read.conn_id,
+                                    param->read.trans_id, ESP_GATT_OK, &rsp);
+        break;
+    }
 }
 
-/// @brief Write event handler for specifi UUID
-/// @param gatts_if  GATT interface type
-/// @param param GATT server callback parameters
+// ── Write event handler ───────────────────────────────────────────────────────
 static void handle_write_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    ESP_LOGI(BLE_TAG, "WRITE_EVT handle=%d len=%d", param->write.handle, param->write.len);
+    ESP_LOG_BUFFER_HEX(BLE_TAG, param->write.value, param->write.len);
 
-        ESP_LOGI(BLE_TAG, "WRITE_EVT, handle = %d, value len = %d, value : %s", param->write.handle, param->write.len, param->write.value);
-        ESP_LOG_BUFFER_HEX(BLE_TAG, param->write.value, param->write.len);
-        char value[param->write.len + 1];
-        memcpy(value, param->write.value, param->write.len);
-        value[param->write.len] = '\0';
-        
-        switch (param->write.handle - 40)
-        {
-        case DEVICE_CHAR_VAL_ID:
-            // Restart the device to apply new settings
-            esp_restart();
-            break;
-        case DEVICE_CHAR_VAL_WIFI_SSID:
-            ESP_LOGI(BLE_TAG, "WIFI SSID WRITE");
-            write_str_nvs("wifi_ssid", value);
-            break;
-        case DEVICE_CHAR_VAL_WIFI_PSWD:
-            ESP_LOGI(BLE_TAG, "WIFI PASSWORD WRITE");
-            write_str_nvs("wifi_pswd", value);
-            break;
-            
-        // ==========================================================
-        // NUEVO CASO: ATRAPAR EL COMANDO DE LA JAULA
-        // ==========================================================
-        case DEVICE_CHAR_VAL_JAULA:
-            ESP_LOGI(BLE_TAG, "COMANDO BLE: Programar Jaula recibido");
-            
-            // Convertir el texto recibido (ej. "99") a número
-            uint16_t num_jaula = (uint16_t)atoi(value); 
-            
-            if (num_jaula >= 1 && num_jaula <= 250) {
-                // Enviar el número al main.c a través de la cola
+    // Copiar valor como string null-terminated
+    uint16_t len = (param->write.len < GATTS_DEMO_CHAR_VAL_LEN_MAX)
+                   ? param->write.len
+                   : GATTS_DEMO_CHAR_VAL_LEN_MAX;
+    char value[GATTS_DEMO_CHAR_VAL_LEN_MAX + 1];
+    memcpy(value, param->write.value, len);
+    value[len] = '\0';
+
+    switch (param->write.handle - 40)
+    {
+    case DEVICE_CHAR_VAL_ID:
+        esp_restart();
+        break;
+
+    case DEVICE_CHAR_VAL_WIFI_SSID:
+        ESP_LOGI(BLE_TAG, "WRITE: WiFi SSID → %s", value);
+        write_str_nvs("wifi_ssid", value);
+        break;
+
+    case DEVICE_CHAR_VAL_WIFI_PSWD:
+        ESP_LOGI(BLE_TAG, "WRITE: WiFi PSWD → %s", value);
+        write_str_nvs("wifi_pswd", value);
+        break;
+
+    // ── Número de Jaula (0xA0B4) ─────────────────────────────────────────────
+    // Escribir un número (1-9999) → encola la orden de programación.
+    // Escribir "READ"            → activa el flag de lectura de EEPROM.
+    case DEVICE_CHAR_VAL_JAULA:
+        if (strcmp(value, "READ") == 0) {
+            ESP_LOGI(BLE_TAG, "WRITE: Jaula → COMANDO LEER EEPROM");
+            ble_cmd_leer = true;
+        } else {
+            uint16_t num_jaula = (uint16_t)atoi(value);
+            if (num_jaula >= 1 && num_jaula <= 9999) {
+                ESP_LOGI(BLE_TAG, "WRITE: Jaula → #%d (dolly pendiente: #%d)",
+                         num_jaula, (int)ble_pending_dolly);
                 if (cola_programacion_jaula != NULL) {
                     xQueueSend(cola_programacion_jaula, &num_jaula, 0);
-                    ESP_LOGI(BLE_TAG, "Número %d enviado a la cola de programación", num_jaula);
-                } else {
-                    ESP_LOGE(BLE_TAG, "ERROR: La cola no está inicializada");
                 }
             } else {
-                ESP_LOGE(BLE_TAG, "Número inválido. Debe estar entre 1 y 250.");
+                ESP_LOGE(BLE_TAG, "Número de jaula inválido: '%s' (rango 1-9999)", value);
             }
-            break;
-        // ==========================================================
-
-        default:
-            break;
         }
+        break;
+
+    // ── Número de Dolly (0xA0B6) ─────────────────────────────────────────────
+    // Escribir un número (1-9999) → guarda como dolly pendiente.
+    // Escribir "0" o "NONE"      → sin dolly (borra el pendiente).
+    case DEVICE_CHAR_VAL_DOLLY:
+        if (strcmp(value, "NONE") == 0 || strcmp(value, "0") == 0) {
+            ble_pending_dolly = 0;
+            ESP_LOGI(BLE_TAG, "WRITE: Dolly → sin dolly");
+        } else {
+            uint16_t num_dolly = (uint16_t)atoi(value);
+            if (num_dolly >= 1 && num_dolly <= 9999) {
+                ble_pending_dolly = num_dolly;
+                ESP_LOGI(BLE_TAG, "WRITE: Dolly pendiente → #%d", num_dolly);
+            } else {
+                ESP_LOGE(BLE_TAG, "Número de dolly inválido: '%s' (rango 1-9999)", value);
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
 }
 
-/// @brief GAP event handler
-/// @param event GAP BLE callback event type
-/// @param param GAP callback parameters
+// ── GAP event handler ─────────────────────────────────────────────────────────
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
-        case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-            adv_config_done &= (~ADV_CONFIG_FLAG);
-            if (adv_config_done == 0){
-                esp_ble_gap_start_advertising(&adv_params);
-            }
-            break;
-        case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
-            adv_config_done &= (~SCAN_RSP_CONFIG_FLAG);
-            if (adv_config_done == 0){
-                esp_ble_gap_start_advertising(&adv_params);
-            }
-            break;
-        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-            /* advertising start complete event to indicate advertising start successfully or failed */
-            if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-                ESP_LOGE(BLE_TAG, "advertising start failed");
-            }else{
-                ESP_LOGI(BLE_TAG, "advertising start successfully");
-            }
-            break;
-        case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
-            if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-                ESP_LOGE(BLE_TAG, "Advertising stop failed");
-            }
-            else {
-                ESP_LOGI(BLE_TAG, "Stop adv successfully");
-            }
-            break;
-        case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
-            ESP_LOGI(BLE_TAG, "update connection params status = %d, min_int = %d, max_int = %d,conn_int = %d,latency = %d, timeout = %d",
-                  param->update_conn_params.status,
-                  param->update_conn_params.min_int,
-                  param->update_conn_params.max_int,
-                  param->update_conn_params.conn_int,
-                  param->update_conn_params.latency,
-                  param->update_conn_params.timeout);
-            break;
-        default:
-            break;
+    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
+        adv_config_done &= (~ADV_CONFIG_FLAG);
+        if (adv_config_done == 0) esp_ble_gap_start_advertising(&adv_params);
+        break;
+    case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
+        adv_config_done &= (~SCAN_RSP_CONFIG_FLAG);
+        if (adv_config_done == 0) esp_ble_gap_start_advertising(&adv_params);
+        break;
+    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS)
+            ESP_LOGE(BLE_TAG, "Advertising start failed");
+        else
+            ESP_LOGI(BLE_TAG, "Advertising start OK");
+        break;
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS)
+            ESP_LOGE(BLE_TAG, "Advertising stop failed");
+        break;
+    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+        ESP_LOGI(BLE_TAG, "Conn params update: min=%d max=%d latency=%d timeout=%d",
+                 param->update_conn_params.min_int, param->update_conn_params.max_int,
+                 param->update_conn_params.latency,  param->update_conn_params.timeout);
+        break;
+    default:
+        break;
     }
 }
 
-/// @brief GATT profile event handler
-/// @param event GATT Server callback function events
-/// @param gatts_if GATT interface type
-/// @param param GATT server callback parameters
-static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
+// ── GATTS profile event handler ───────────────────────────────────────────────
+static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
+                                        esp_gatt_if_t gatts_if,
+                                        esp_ble_gatts_cb_param_t *param)
 {
     switch (event) {
-        case ESP_GATTS_REG_EVT:{
-            esp_err_t set_dev_name_ret = esp_ble_gap_set_device_name(CONFIG_DEVICE_NAME);
-            if (set_dev_name_ret){
-                ESP_LOGE(BLE_TAG, "set device name failed, error code = %x", set_dev_name_ret);
-            }
-            //config adv data
-            esp_err_t ret = esp_ble_gap_config_adv_data(&adv_data);
-            if (ret){
-                ESP_LOGE(BLE_TAG, "config adv data failed, error code = %x", ret);
-            }
-            adv_config_done |= ADV_CONFIG_FLAG;
-            //config scan response data
-            ret = esp_ble_gap_config_adv_data(&scan_rsp_data);
-            if (ret){
-                ESP_LOGE(BLE_TAG, "config scan response data failed, error code = %x", ret);
-            }
-            adv_config_done |= SCAN_RSP_CONFIG_FLAG;
-            esp_err_t create_attr_ret = esp_ble_gatts_create_attr_tab(gatt_db, gatts_if, DEVICE_IDX_NB, SVC_INST_ID);
-            if (create_attr_ret){
-                ESP_LOGE(BLE_TAG, "create attr table failed, error code = %x", create_attr_ret);
+    case ESP_GATTS_REG_EVT: {
+        esp_err_t ret = esp_ble_gap_set_device_name(CONFIG_DEVICE_NAME);
+        if (ret) ESP_LOGE(BLE_TAG, "set device name failed: %x", ret);
+        ret = esp_ble_gap_config_adv_data(&adv_data);
+        if (ret) ESP_LOGE(BLE_TAG, "config adv data failed: %x", ret);
+        adv_config_done |= ADV_CONFIG_FLAG;
+        ret = esp_ble_gap_config_adv_data(&scan_rsp_data);
+        if (ret) ESP_LOGE(BLE_TAG, "config scan rsp failed: %x", ret);
+        adv_config_done |= SCAN_RSP_CONFIG_FLAG;
+        ret = esp_ble_gatts_create_attr_tab(gatt_db, gatts_if, DEVICE_IDX_NB, SVC_INST_ID);
+        if (ret) ESP_LOGE(BLE_TAG, "create attr table failed: %x", ret);
+        break;
+    }
+    case ESP_GATTS_READ_EVT:
+        ESP_LOGI(BLE_TAG, "ESP_GATTS_READ_EVT");
+        handle_read_event(gatts_if, param);
+        break;
+
+    case ESP_GATTS_WRITE_EVT:
+        if (!param->write.is_prep) {
+            handle_write_event(gatts_if, param);
+            if (param->write.need_rsp) {
+                esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
+                                            param->write.trans_id, ESP_GATT_OK, NULL);
             }
         }
-       	    break;
-        case ESP_GATTS_READ_EVT:
-            ESP_LOGI(BLE_TAG, "ESP_GATTS_READ_EVT");
-            handle_read_event(gatts_if, param);
-       	    break;
-        case ESP_GATTS_WRITE_EVT:
-            if (!param->write.is_prep){
+        break;
 
-                ESP_LOGI(BLE_TAG, "WRITE_EVT, handle = %d, value len = %d, value :", param->write.handle, param->write.len);
-                ESP_LOG_BUFFER_HEX(BLE_TAG, param->write.value, param->write.len);
-                handle_write_event(gatts_if, param);
-                if (param->write.need_rsp){
-                        esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
-                }
-            }
-      	    break;
-        case ESP_GATTS_EXEC_WRITE_EVT:
-            // the length of gattc prepare write data must be less than GATTS_DEMO_CHAR_VAL_LEN_MAX.
-            ESP_LOGI(BLE_TAG, "ESP_GATTS_EXEC_WRITE_EVT");
-            break;
-        case ESP_GATTS_MTU_EVT:
-            ESP_LOGI(BLE_TAG, "ESP_GATTS_MTU_EVT, MTU %d", param->mtu.mtu);
-            break;
-        case ESP_GATTS_CONF_EVT:
-            ESP_LOGI(BLE_TAG, "ESP_GATTS_CONF_EVT, status = %d, attr_handle %d", param->conf.status, param->conf.handle);
-            break;
-        case ESP_GATTS_START_EVT:
-            ESP_LOGI(BLE_TAG, "SERVICE_START_EVT, status %d, service_handle %d", param->start.status, param->start.service_handle);
-            break;
-        case ESP_GATTS_CONNECT_EVT:
-            ESP_LOGI(BLE_TAG, "ESP_GATTS_CONNECT_EVT, conn_id = %d", param->connect.conn_id);
-            // ---> GUARDAMOS LA CONEXIÓN PARA LAS NOTIFICACIONES <---
-            ble_gatts_if = gatts_if;
-            ble_conn_id = param->connect.conn_id;
-            ble_is_connected = true;
+    case ESP_GATTS_EXEC_WRITE_EVT:
+        ESP_LOGI(BLE_TAG, "ESP_GATTS_EXEC_WRITE_EVT");
+        break;
 
-            ESP_LOG_BUFFER_HEX(BLE_TAG, param->connect.remote_bda, 6);
-            esp_ble_conn_update_params_t conn_params = {0};
-            memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-            /* For the iOS system, please refer to Apple official documents about the BLE connection parameters restrictions. */
-            conn_params.latency = 0;
-            conn_params.max_int = 0x20;    // max_int = 0x20*1.25ms = 40ms
-            conn_params.min_int = 0x10;    // min_int = 0x10*1.25ms = 20ms
-            conn_params.timeout = 400;    // timeout = 400*10ms = 4000ms
-            //start sent the update connection parameters to the peer device.
-            esp_ble_gap_update_conn_params(&conn_params);
-            break;
-        case ESP_GATTS_DISCONNECT_EVT:
-            ESP_LOGI(BLE_TAG, "ESP_GATTS_DISCONNECT_EVT, reason = 0x%x", param->disconnect.reason);
-            // ---> BORRAMOS LA CONEXIÓN <---
-            ble_is_connected = false;
-            esp_ble_gap_start_advertising(&adv_params);
-            break;
-        case ESP_GATTS_CREAT_ATTR_TAB_EVT:{
-            if (param->add_attr_tab.status != ESP_GATT_OK){
-                ESP_LOGE(BLE_TAG, "create attribute table failed, error code=0x%x", param->add_attr_tab.status);
-            }
-            else if (param->add_attr_tab.num_handle != DEVICE_IDX_NB){
-                ESP_LOGE(BLE_TAG, "create attribute table abnormally, num_handle (%d) \
-                        doesn't equal to HRS_IDX_NB(%d)", param->add_attr_tab.num_handle, DEVICE_IDX_NB);
-            }
-            else {
-                ESP_LOGI(BLE_TAG, "create attribute table successfully, the number handle = %d",param->add_attr_tab.num_handle);
-                memcpy(device_handle_table, param->add_attr_tab.handles, sizeof(device_handle_table));
-                esp_ble_gatts_start_service(device_handle_table[DEVICE_SVC]);
-            }
-            break;
+    case ESP_GATTS_MTU_EVT:
+        ESP_LOGI(BLE_TAG, "MTU %d", param->mtu.mtu);
+        break;
+
+    case ESP_GATTS_CONF_EVT:
+        ESP_LOGI(BLE_TAG, "CONF status=%d handle=%d", param->conf.status, param->conf.handle);
+        break;
+
+    case ESP_GATTS_START_EVT:
+        ESP_LOGI(BLE_TAG, "SERVICE_START status=%d handle=%d",
+                 param->start.status, param->start.service_handle);
+        break;
+
+    case ESP_GATTS_CONNECT_EVT:
+        ESP_LOGI(BLE_TAG, "CONNECT conn_id=%d", param->connect.conn_id);
+        ble_gatts_if    = gatts_if;
+        ble_conn_id     = param->connect.conn_id;
+        ble_is_connected = true;
+        ESP_LOG_BUFFER_HEX(BLE_TAG, param->connect.remote_bda, 6);
+        esp_ble_conn_update_params_t conn_params = {0};
+        memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+        conn_params.latency = 0;
+        conn_params.max_int = 0x20;
+        conn_params.min_int = 0x10;
+        conn_params.timeout = 400;
+        esp_ble_gap_update_conn_params(&conn_params);
+        break;
+
+    case ESP_GATTS_DISCONNECT_EVT:
+        ESP_LOGI(BLE_TAG, "DISCONNECT reason=0x%x", param->disconnect.reason);
+        ble_is_connected  = false;
+        ble_pending_dolly = 0;   // Limpiar dolly pendiente al desconectar
+        ble_cmd_leer      = false;
+        esp_ble_gap_start_advertising(&adv_params);
+        break;
+
+    case ESP_GATTS_CREAT_ATTR_TAB_EVT:
+        if (param->add_attr_tab.status != ESP_GATT_OK) {
+            ESP_LOGE(BLE_TAG, "create attr table failed, error=0x%x",
+                     param->add_attr_tab.status);
+        } else if (param->add_attr_tab.num_handle != DEVICE_IDX_NB) {
+            ESP_LOGE(BLE_TAG, "attr table handle count mismatch: got %d, expected %d",
+                     param->add_attr_tab.num_handle, DEVICE_IDX_NB);
+        } else {
+            ESP_LOGI(BLE_TAG, "Attr table OK, handles=%d", param->add_attr_tab.num_handle);
+            memcpy(device_handle_table, param->add_attr_tab.handles,
+                   sizeof(device_handle_table));
+            esp_ble_gatts_start_service(device_handle_table[DEVICE_SVC]);
         }
-        case ESP_GATTS_STOP_EVT:
-        case ESP_GATTS_OPEN_EVT:
-        case ESP_GATTS_CANCEL_OPEN_EVT:
-        case ESP_GATTS_CLOSE_EVT:
-        case ESP_GATTS_LISTEN_EVT:
-        case ESP_GATTS_CONGEST_EVT:
-        case ESP_GATTS_UNREG_EVT:
-        case ESP_GATTS_DELETE_EVT:
-        default:
-            break;
+        break;
+
+    case ESP_GATTS_STOP_EVT:
+    case ESP_GATTS_OPEN_EVT:
+    case ESP_GATTS_CANCEL_OPEN_EVT:
+    case ESP_GATTS_CLOSE_EVT:
+    case ESP_GATTS_LISTEN_EVT:
+    case ESP_GATTS_CONGEST_EVT:
+    case ESP_GATTS_UNREG_EVT:
+    case ESP_GATTS_DELETE_EVT:
+    default:
+        break;
     }
 }
 
-/// @brief GATT Event handler
-/// @param event GATT Server callback function events
-/// @param gatts_if GATT interface type
-/// @param param Gatt server callback parameters
-static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
+// ── GATT event dispatcher ─────────────────────────────────────────────────────
+static void gatts_event_handler(esp_gatts_cb_event_t event,
+                                esp_gatt_if_t gatts_if,
+                                esp_ble_gatts_cb_param_t *param)
 {
-
-    /* If event is register event, store the gatts_if for each profile */
     if (event == ESP_GATTS_REG_EVT) {
         if (param->reg.status == ESP_GATT_OK) {
             device_profile_tab[PROFILE_APP_IDX].gatts_if = gatts_if;
         } else {
             ESP_LOGE(BLE_TAG, "reg app failed, app_id %04x, status %d",
-                    param->reg.app_id,
-                    param->reg.status);
+                     param->reg.app_id, param->reg.status);
             return;
         }
     }
-    do {
-        int idx;
-        for (idx = 0; idx < PROFILE_NUM; idx++) {
-            /* ESP_GATT_IF_NONE, not specify a certain gatt_if, need to call every profile cb function */
-            if (gatts_if == ESP_GATT_IF_NONE || gatts_if == device_profile_tab[idx].gatts_if) {
-                if (device_profile_tab[idx].gatts_cb) {
-                    device_profile_tab[idx].gatts_cb(event, gatts_if, param);
-                }
+    for (int idx = 0; idx < PROFILE_NUM; idx++) {
+        if (gatts_if == ESP_GATT_IF_NONE ||
+            gatts_if == device_profile_tab[idx].gatts_if) {
+            if (device_profile_tab[idx].gatts_cb) {
+                device_profile_tab[idx].gatts_cb(event, gatts_if, param);
             }
         }
-    } while (0);
+    }
 }
 
-/// @brief Enable Bluetooth and advertisement BLE Service
-void ble_init(){
+// ── API pública ───────────────────────────────────────────────────────────────
+void ble_init() {
     esp_err_t ret;
 
     esp_bluedroid_status_t ble_status = esp_bluedroid_get_status();
-    ESP_LOGI(BLE_TAG, "BLUEDROID STATUS %d", ble_status);
-    if (ble_status == ESP_BLUEDROID_STATUS_ENABLED)
-    {
-        ESP_LOGI(BLE_TAG,"Bluetooth already enable");
+    if (ble_status == ESP_BLUEDROID_STATUS_ENABLED) {
+        ESP_LOGI(BLE_TAG, "BLE ya estaba habilitado");
         return;
     }
 
-    // Release memory used by Classic Bluetooth if not needed
     ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(BLE_TAG, "Memory release failed: %s", esp_err_to_name(ret));
-        return;
-    }
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+        ESP_LOGW(BLE_TAG, "Memory release: %s", esp_err_to_name(ret));
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ret = esp_bt_controller_init(&bt_cfg);
-    if (ret) {
-        ESP_LOGE(BLE_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(ret));
-        return;
-    }
+    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
 
-    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (ret) {
-        ESP_LOGE(BLE_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(ret));
-        return;
-    }
-    esp_bluedroid_config_t bldroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
-    ret = esp_bluedroid_init_with_cfg(&bldroid_cfg);
-    if (ret) {
-        ESP_LOGE(BLE_TAG, "%s init bluetooth failed: %s", __func__, esp_err_to_name(ret));
-        return;
-    }
+    esp_bluedroid_config_t bld_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bluedroid_init_with_cfg(&bld_cfg));
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
 
-    ret = esp_bluedroid_enable();
-    if (ret) {
-        ESP_LOGE(BLE_TAG, "%s enable bluetooth failed: %s", __func__, esp_err_to_name(ret));
-        return;
-    }
-
-    ret = esp_ble_gatts_register_callback(gatts_event_handler);
-    if (ret){
-        ESP_LOGE(BLE_TAG, "gatts register error, error code = %x", ret);
-        return;
-    }
-
-    ret = esp_ble_gap_register_callback(gap_event_handler);
-    if (ret){
-        ESP_LOGE(BLE_TAG, "gap register error, error code = %x", ret);
-        return;
-    }
-
-    ret = esp_ble_gatts_app_register(ESP_APP_ID);
-    if (ret){
-        ESP_LOGE(BLE_TAG, "gatts app register error, error code = %x", ret);
-        return;
-    }
-
-    esp_err_t local_mtu_ret = esp_ble_gatt_set_local_mtu(500);
-    if (local_mtu_ret){
-        ESP_LOGE(BLE_TAG, "set local  MTU failed, error code = %x", local_mtu_ret);
-    }
+    ESP_ERROR_CHECK(esp_ble_gatts_register_callback(gatts_event_handler));
+    ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
+    ESP_ERROR_CHECK(esp_ble_gatts_app_register(ESP_APP_ID));
+    ESP_ERROR_CHECK(esp_ble_gatt_set_local_mtu(500));
 }
 
-
-/// @brief Envia una notificacion de texto al celular
-/// @param mensaje Texto a enviar
 void ble_enviar_status(const char* mensaje) {
     if (!ble_is_connected) {
-        ESP_LOGW(BLE_TAG, "No hay cliente BLE conectado para enviar notificacion");
+        ESP_LOGW(BLE_TAG, "Sin cliente BLE — notificación descartada: %s", mensaje);
         return;
     }
-
-    // Buscamos la direccion (handle) de nuestro buzón de status
     uint16_t attr_handle = device_handle_table[DEVICE_CHAR_VAL_STATUS];
-    
-    // Enviamos el mensaje
     esp_ble_gatts_send_indicate(
-        ble_gatts_if,
-        ble_conn_id,
-        attr_handle,
-        strlen(mensaje),
-        (uint8_t *)mensaje,
-        false); // false = Notificación (sin confirmación), true = Indicación
-        
-    ESP_LOGI(BLE_TAG, "Notificación enviada: %s", mensaje);
+        ble_gatts_if, ble_conn_id, attr_handle,
+        strlen(mensaje), (uint8_t *)mensaje,
+        false);
+    ESP_LOGI(BLE_TAG, "Notificación → %s", mensaje);
 }
 
-/// @brief Disable Bluetooth and advertisement BLE Service
-void ble_deinit(){
-    esp_err_t ret;
-
+void ble_deinit() {
     esp_bluedroid_status_t ble_status = esp_bluedroid_get_status();
-    ESP_LOGI(BLE_TAG, "BLUEDROID STATUS %d", ble_status);
-    if (ble_status == ESP_BLUEDROID_STATUS_UNINITIALIZED || ble_status == ESP_BLUEDROID_STATUS_INITIALIZED)
-    {
-        ESP_LOGI(BLE_TAG,"Bluetooth not initialized");
+    if (ble_status == ESP_BLUEDROID_STATUS_UNINITIALIZED ||
+        ble_status == ESP_BLUEDROID_STATUS_INITIALIZED) {
+        ESP_LOGI(BLE_TAG, "BLE no estaba activo");
         return;
     }
-
-    // Disable Bluedroid
-    ret = esp_bluedroid_disable();
-    if (ret) {
-        ESP_LOGE(BLE_TAG, "%s disable bluetooth failed: %s", __func__, esp_err_to_name(ret));
-    }
-
-    // Deinitialize Bluedroid
-    ret = esp_bluedroid_deinit();
-    if (ret) {
-        ESP_LOGE(BLE_TAG, "%s deinit bluetooth failed: %s", __func__, esp_err_to_name(ret));
-    }
-
-    // Disable BT controller
-    ret = esp_bt_controller_disable();
-    if (ret) {
-        ESP_LOGE(BLE_TAG, "%s disable controller failed: %s", __func__, esp_err_to_name(ret));
-    }
-
-    // Deinitialize BT controller
-    ret = esp_bt_controller_deinit();
-    if (ret) {
-        ESP_LOGE(BLE_TAG, "%s deinit controller failed: %s", __func__, esp_err_to_name(ret));
-    }
-
+    ESP_ERROR_CHECK(esp_bluedroid_disable());
+    ESP_ERROR_CHECK(esp_bluedroid_deinit());
+    ESP_ERROR_CHECK(esp_bt_controller_disable());
+    ESP_ERROR_CHECK(esp_bt_controller_deinit());
 }
-
-
-
