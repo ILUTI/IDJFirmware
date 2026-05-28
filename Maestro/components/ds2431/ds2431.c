@@ -34,7 +34,7 @@ esp_err_t ds2431_match_rom(ds2482_t *ds2482, ds2431_t *dev) {
     for (int intento = 0; intento < 3; intento++) {
         err = ds2482_1wire_reset(&presence);
         if (err == ESP_OK && presence) break;
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(30));  // 30ms: bus de 80m necesita más tiempo entre reintentos
     }
 
     if (err != ESP_OK || !presence) {
@@ -243,30 +243,35 @@ esp_err_t ds2431_escribir_datos(ds2482_t *ds2482, ds2431_t *dev, const ds2431_da
         size_t tam_bloque = 8; 
         uint16_t addr = (uint16_t)pos;
 
-        // Reset de bridge antes de cada bloque (buena práctica para cables largos)
+        // Reset de bridge antes de cada bloque — 15ms para bus de 80m
         ds2482_1wire_reset(&(bool){false});
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(15));
 
         // Escribir Scratchpad
         esp_err_t err = ds2431_write_scratchpad(ds2482, dev, addr, &buf[pos], tam_bloque);
         if (err != ESP_OK) return err;
 
-        // Leer Scratchpad
+        // Leer Scratchpad para verificar antes de hacer el copy
         uint8_t ta1, ta2, es_byte;
         uint8_t verify[8];
-        ds2431_match_rom(ds2482, dev);
-        ds2482_write_byte(DS2431_CMD_READ_SCRATCHPAD);
-        ds2482_read_byte(&ta1); 
-        ds2482_read_byte(&ta2); 
-        ds2482_read_byte(&es_byte);
-        for (int i = 0; i < tam_bloque; i++) ds2482_read_byte(&verify[i]);
+        err = ds2431_match_rom(ds2482, dev);
+        if (err != ESP_OK) return err;
+        err = ds2482_write_byte(DS2431_CMD_READ_SCRATCHPAD);
+        if (err != ESP_OK) return err;
+        err = ds2482_read_byte(&ta1);  if (err != ESP_OK) return err;
+        err = ds2482_read_byte(&ta2);  if (err != ESP_OK) return err;
+        err = ds2482_read_byte(&es_byte); if (err != ESP_OK) return err;
+        for (int i = 0; i < (int)tam_bloque; i++) {
+            err = ds2482_read_byte(&verify[i]);
+            if (err != ESP_OK) return err;
+        }
 
         if (memcmp(&buf[pos], verify, tam_bloque) != 0) {
             ESP_LOGE(TAG, "Error de validacion scratchpad en 0x%02X", addr);
             return ESP_ERR_INVALID_RESPONSE;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(20));  // 20ms: bus de 80m necesita más margen antes del copy
 
         // Copiar a EEPROM
         err = ds2431_copy_scratchpad(ds2482, dev, addr, es_byte);
@@ -275,7 +280,7 @@ esp_err_t ds2431_escribir_datos(ds2482_t *ds2482, ds2431_t *dev, const ds2431_da
         ESP_LOGI(TAG, "Bloque 0x%02X grabado OK", addr);
 
         pos += tam_bloque;
-        vTaskDelay(pdMS_TO_TICKS(20)); // Tiempo para enfriar la EEPROM
+        vTaskDelay(pdMS_TO_TICKS(40)); // 40ms entre bloques: enfriamiento EEPROM + bus recovery
     }
     return ESP_OK;
 }
