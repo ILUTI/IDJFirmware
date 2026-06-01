@@ -1,5 +1,4 @@
-// Codigo ESP32-C3 maestro IDJ
-// Librerías de ESP-IDF y componentes
+// IDJ Maestro v2 — con soporte de Dolly
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -7,8 +6,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-# include "nvs.h"
-# include "nvs_flash.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "cJSON.h"
 
 #include "nvs_component.h"
@@ -17,98 +16,86 @@
 #include "wifi_component.h"
 
 #include "driver/i2c.h"
-#include "ds2482.h" // header del DS2482 para bridge y comunicación del maestro 1-wire
-#include "ds2431.h" // header del DS2431 para lectura del rom y esclavo 1-wire
+#include "ds2482.h"
+#include "ds2431.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 
-#define TAG "IDJ" // defino el tag del logger y dispositivo
+#define TAG "IDJ"
 
 // Configuración del bus I2C
-#define I2C_MASTER_SCL_IO 5 // SCL IO4
-#define I2C_MASTER_SDA_IO 4 // SDA IO5
-#define I2C_MASTER_NUM I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ 100000 // frecuencia del canal I2C
+#define I2C_MASTER_SCL_IO    5
+#define I2C_MASTER_SDA_IO    4
+#define I2C_MASTER_NUM       I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ   100000
 
-// 1. Creación de la estructura de dispositivos, agregar unidad, rom, timestamp, y status actual del dispositivo.
-#define MAX_DEVICES 20 // definir la cantidad maxima de dispositivos para guardar
+// Parámetros de escaneo
+#define MAX_DEVICES          20
+#define AUSENCIAS_EVICTAR    5
+#define SCAN_INTERVAL_MS     3000   // Ciclo base: 3 segundos
+#define BUS_ERRORES_MAX      5
+#define CICLOS_EEPROM        10     // 10 × 3s = 30s entre lecturas completas de EEPROM
+
+// ── Estructura de dispositivo v2 (con Dolly) ─────────────────────────────────
 typedef struct {
-    uint64_t rom; // rom unica de cada ds2431
-    char rom_str[17]; // representación en string del rom para JSON (16 caracteres + null terminator)
-    char unidad[12];   // "T0603-xxxx" codigo para jaulas
-    bool asignado; // indicador para saber si ya fue asignado o no.
-    uint8_t ausencias;
-    bool presente;
+    uint64_t rom;
+    char     rom_str[17];
+    char     unidad[12];
+    char     unidad_dolly[12];
+    bool     tiene_dolly;
+    bool     asignado;
+    uint8_t  ausencias;
+    bool     presente;
 } dispositivo_t;
 
-static dispositivo_t dispositivos[MAX_DEVICES]; // asigno el tamaño del arreglo
-static size_t num_dispositivos = 0; // contador de dispositivos registrados
-static bool nvs_dirty = false;      // se activa cuando hay cambios pendientes de guardar
+static dispositivo_t dispositivos[MAX_DEVICES];
+static size_t num_dispositivos = 0;
+static bool nvs_dirty = false;
 
-// normalización de ROM para formato consistente
+// ── Utilidades de ROM ─────────────────────────────────────────────────────────
 void rom_to_string(uint64_t rom, char *output) {
-    uint8_t *bytes = (uint8_t*)&rom;
-    for (int i = 0; i < 8; i++) {
-        sprintf(output + (i * 2), "%02X", bytes[i]); // <-- sin invertir
-    }
+    uint8_t *bytes = (uint8_t *)&rom;
+    for (int i = 0; i < 8; i++) sprintf(output + (i * 2), "%02X", bytes[i]);
     output[16] = '\0';
 }
 
-// Convierte el string del JSON de vuelta a uint64_t respetando el orden físico (Little-Endian)
 uint64_t string_to_rom(const char *str) {
     uint64_t rom = 0;
-    uint8_t *bytes = (uint8_t*)&rom;
-    for (int i = 0; i < 8; i++) {
-        // Leemos de 2 en 2 caracteres y los guardamos secuencialmente en la RAM
-        sscanf(str + (i * 2), "%2hhx", &bytes[i]); 
-    }
+    uint8_t *bytes = (uint8_t *)&rom;
+    for (int i = 0; i < 8; i++) sscanf(str + (i * 2), "%2hhx", &bytes[i]);
     return rom;
 }
 
-// También una función de validación del Family Code del DS2431
-// El DS2431 siempre tiene Family Code = 0x2D en byte[0].
 bool rom_es_ds2431(uint64_t rom) {
-    uint8_t family = (uint8_t)(rom & 0xFF); // byte[0] en little-endian es el LSB
-    return (family == 0x2D);
+    return ((uint8_t)(rom & 0xFF) == 0x2D);
 }
 
-// Genera "T0603-xxxx" a partir del número de jaula
-void generar_unidad(uint16_t jaula, char *out) {
-    snprintf(out, 12, "T0603-%04d", jaula);
-}
-// -----------------------------------
-
-// 2. Funciones para registro de dispositivos en la NVS, guardo y cargo el JSON
-// Funcion para guardar en la NVS del esp32
+// ── NVS ───────────────────────────────────────────────────────────────────────
 void guardar_en_nvs() {
     nvs_handle_t handle;
     esp_err_t err = nvs_open("storage", NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error abriendo NVS para escritura: %s", esp_err_to_name(err));
-        return;
-    }
+    if (err != ESP_OK) { ESP_LOGE(TAG, "Error NVS: %s", esp_err_to_name(err)); return; }
 
-    cJSON *root = cJSON_CreateObject();
+    cJSON *root  = cJSON_CreateObject();
     cJSON *array = cJSON_AddArrayToObject(root, "devices");
 
     for (size_t i = 0; i < num_dispositivos; i++) {
         cJSON *obj = cJSON_CreateObject();
-        cJSON_AddStringToObject(obj, "rom", dispositivos[i].rom_str);
-        cJSON_AddStringToObject(obj, "unidad", dispositivos[i].unidad);
-        cJSON_AddBoolToObject(obj, "asignado", dispositivos[i].asignado);
+        cJSON_AddStringToObject(obj, "rom",          dispositivos[i].rom_str);
+        cJSON_AddStringToObject(obj, "unidad",       dispositivos[i].unidad);
+        cJSON_AddStringToObject(obj, "unidad_dolly", dispositivos[i].unidad_dolly);
+        cJSON_AddBoolToObject  (obj, "tiene_dolly",  dispositivos[i].tiene_dolly);
+        cJSON_AddBoolToObject  (obj, "asignado",     dispositivos[i].asignado);
         cJSON_AddItemToArray(array, obj);
     }
 
-    char *json_str = cJSON_PrintUnformatted(root); // <-- PrintUnformatted ahorra espacio en NVS
+    char *json_str = cJSON_PrintUnformatted(root);
     if (json_str) {
         err = nvs_set_str(handle, "devices", json_str);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Error guardando en NVS: %s", esp_err_to_name(err));
-        }
+        if (err != ESP_OK) ESP_LOGE(TAG, "Error guardando NVS: %s", esp_err_to_name(err));
         nvs_commit(handle);
         free(json_str);
     }
-
     cJSON_Delete(root);
     nvs_close(handle);
 }
@@ -116,299 +103,237 @@ void guardar_en_nvs() {
 void cargar_desde_nvs() {
     nvs_handle_t handle;
     esp_err_t err = nvs_open("storage", NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error abriendo NVS para lectura: %s", esp_err_to_name(err));
-        return;
-    }
+    if (err != ESP_OK) { ESP_LOGE(TAG, "Error NVS: %s", esp_err_to_name(err)); return; }
 
     size_t required_size = 0;
     err = nvs_get_str(handle, "devices", NULL, &required_size);
 
     if (err == ESP_OK && required_size > 0) {
         char *json_str = malloc(required_size);
-        if (!json_str) {
-            ESP_LOGE(TAG, "malloc falló al cargar NVS");
-            nvs_close(handle);
-            return;
-        }
+        if (!json_str) { nvs_close(handle); return; }
 
         nvs_get_str(handle, "devices", json_str, &required_size);
         cJSON *root = cJSON_Parse(json_str);
 
-        if (root) { // <-- verificar que el JSON parseó correctamente
+        if (root) {
             cJSON *array = cJSON_GetObjectItem(root, "devices");
             num_dispositivos = 0;
 
             cJSON *item = NULL;
             cJSON_ArrayForEach(item, array) {
                 if (num_dispositivos >= MAX_DEVICES) break;
-
                 cJSON *rom_item    = cJSON_GetObjectItem(item, "rom");
                 cJSON *unidad_item = cJSON_GetObjectItem(item, "unidad");
                 cJSON *asig_item   = cJSON_GetObjectItem(item, "asignado");
-
-                // Verificar que los campos existen antes de usarlos
                 if (!rom_item || !unidad_item || !asig_item) continue;
 
+                size_t idx = num_dispositivos;
                 uint64_t rom = string_to_rom(rom_item->valuestring);
-                dispositivos[num_dispositivos].rom = rom;
-                rom_to_string(rom, dispositivos[num_dispositivos].rom_str);
-                strncpy(dispositivos[num_dispositivos].unidad, unidad_item->valuestring, 11);
-                dispositivos[num_dispositivos].unidad[11] = '\0'; // garantizar null-terminator
-                dispositivos[num_dispositivos].asignado = (bool)asig_item->valueint;
-                // --> NUEVA LÍNEA: Forzar que inicie como desconectada al arrancar
-                dispositivos[num_dispositivos].presente = false;
+                dispositivos[idx].rom = rom;
+                rom_to_string(rom, dispositivos[idx].rom_str);
+                strncpy(dispositivos[idx].unidad, unidad_item->valuestring, 11);
+                dispositivos[idx].unidad[11] = '\0';
+                dispositivos[idx].asignado   = (bool)asig_item->valueint;
+                dispositivos[idx].presente   = false;
+                dispositivos[idx].ausencias  = 0;
+
+                cJSON *dolly_item       = cJSON_GetObjectItem(item, "unidad_dolly");
+                cJSON *tiene_dolly_item = cJSON_GetObjectItem(item, "tiene_dolly");
+                if (dolly_item && tiene_dolly_item) {
+                    dispositivos[idx].tiene_dolly = (bool)tiene_dolly_item->valueint;
+                    if (dispositivos[idx].tiene_dolly) {
+                        strncpy(dispositivos[idx].unidad_dolly, dolly_item->valuestring, 11);
+                        dispositivos[idx].unidad_dolly[11] = '\0';
+                    } else {
+                        memset(dispositivos[idx].unidad_dolly, 0, 12);
+                    }
+                } else {
+                    dispositivos[idx].tiene_dolly = false;
+                    memset(dispositivos[idx].unidad_dolly, 0, 12);
+                }
                 num_dispositivos++;
             }
             cJSON_Delete(root);
         } else {
-            ESP_LOGE(TAG, "JSON en NVS está corrupto, se descarta");
+            ESP_LOGE(TAG, "JSON en NVS corrupto, se descarta");
         }
-
         free(json_str);
     } else {
         ESP_LOGI(TAG, "NVS vacío, iniciando sin dispositivos previos");
     }
-
     nvs_close(handle);
 }
 
-// Funcion que me devuelve si existe o no dispositivo registrado con un rom específico, 
-// evitando duplicados en la memoria. 
+// ── Registro de dispositivos ──────────────────────────────────────────────────
 bool existe_dispositivo_str(const char *rom_str) {
-    for (size_t i = 0; i < num_dispositivos; i++) {
-        if (strcmp(dispositivos[i].rom_str, rom_str) == 0) {
-            return true;
+    for (size_t i = 0; i < num_dispositivos; i++)
+        if (strcmp(dispositivos[i].rom_str, rom_str) == 0) return true;
+    return false;
+}
+
+void agregar_dispositivo(uint64_t rom) {
+    if (num_dispositivos >= MAX_DEVICES) {
+        ESP_LOGW(TAG, "Lista llena"); return;
+    }
+    size_t idx = num_dispositivos;
+    dispositivos[idx].rom       = rom;
+    dispositivos[idx].ausencias = 0;
+    dispositivos[idx].presente  = true;
+    dispositivos[idx].asignado  = false;
+    dispositivos[idx].tiene_dolly = false;
+    memset(dispositivos[idx].unidad,       0, 12);
+    memset(dispositivos[idx].unidad_dolly, 0, 12);
+    rom_to_string(rom, dispositivos[idx].rom_str);
+    ESP_LOGI(TAG, "Nuevo dispositivo: %s", dispositivos[idx].rom_str);
+    num_dispositivos++;
+}
+
+// ── Leer EEPROM de un dispositivo y asignar sus datos ────────────────────────
+// Devuelve true si la lectura fue exitosa.
+bool leer_eeprom_dispositivo(ds2482_t *ds2482, size_t idx) {
+    ds2431_t esclavo = { .rom_code = dispositivos[idx].rom };
+    ds2431_data_t datos;
+    esp_err_t err = ds2431_leer_datos(ds2482, &esclavo, &datos);
+
+    if (err == ESP_OK && datos.valido) {
+        strncpy(dispositivos[idx].unidad, datos.unidad_jaula, 11);
+        dispositivos[idx].unidad[11] = '\0';
+        dispositivos[idx].tiene_dolly = datos.tiene_dolly;
+        if (datos.tiene_dolly) {
+            strncpy(dispositivos[idx].unidad_dolly, datos.unidad_dolly, 11);
+            dispositivos[idx].unidad_dolly[11] = '\0';
+        } else {
+            memset(dispositivos[idx].unidad_dolly, 0, 12);
         }
+        dispositivos[idx].asignado = true;
+        nvs_dirty = true;
+        ESP_LOGI(TAG, "EEPROM leída: %s → Jaula %s | Dolly %s",
+                 dispositivos[idx].rom_str,
+                 dispositivos[idx].unidad,
+                 dispositivos[idx].tiene_dolly ? dispositivos[idx].unidad_dolly : "N/A");
+        return true;
+
+    } else if (err == ESP_ERR_INVALID_CRC) {
+        ESP_LOGW(TAG, "Esclavo %s con formato antiguo — reprogramar",
+                 dispositivos[idx].rom_str);
+    } else {
+        ESP_LOGW(TAG, "Esclavo %s sin datos aún", dispositivos[idx].rom_str);
     }
     return false;
 }
 
-// Funcion para agregar un nuevo dispositivo a la lista
-void agregar_dispositivo(uint64_t rom) {
-    if (num_dispositivos >= MAX_DEVICES) {
-        printf("Lista llena\n");
+// ── Escaneo del bus 1-Wire ────────────────────────────────────────────────────
+//
+// leer_eeprom = false → solo descubre ROMs y actualiza presencia (rápido, 3s)
+// leer_eeprom = true  → además lee la EEPROM de todos los presentes (30s)
+//
+void escanear_dispositivos(ds2482_t *ds2482, bool leer_eeprom) {
+    uint64_t roms[MAX_DEVICES];
+    size_t found = 0;
+
+    esp_err_t err = ds2482_search_rom_all(roms, MAX_DEVICES, &found);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error search_rom_all: %s", esp_err_to_name(err));
         return;
     }
+    ESP_LOGI(TAG, "ROMs en bus: %d | Lectura EEPROM: %s",
+             found, leer_eeprom ? "SI" : "no");
 
-    size_t idx = num_dispositivos;
-    dispositivos[idx].ausencias = 0;
-    dispositivos[idx].presente = true;
-
-
-    rom_to_string(rom, dispositivos[idx].rom_str);
-    dispositivos[idx].rom = rom;
-    strcpy(dispositivos[idx].unidad, "");
-    dispositivos[idx].asignado = false;
-
-    
-
-    ESP_LOGI("IDJ", "Nuevo dispositivo agregado: %s", dispositivos[idx].rom_str);
-    num_dispositivos++;
-    nvs_dirty = true;
-}
-
-#define SCAN_INTERVAL_MS      10000  // intervalo entre ciclos (ms)
-#define AUSENCIAS_PARAR_PING      5  // 5 × 10s = 50s: dejar de gastar bus en Phase 1
-#define AUSENCIAS_EVICTAR        18  // 18 × 10s = ~3min: borrar del registro y NVS
-#define BUS_ERRORES_MAX           5  // reiniciar ESP32 tras 5 errores I2C/1-Wire consecutivos
-
-// Función de escaneo. forzar_descubrimiento = true salta el contador de ciclos
-// y ejecuta el Search ROM inmediatamente (se usa al arrancar sin dispositivos).
-void escanear_dispositivos(ds2482_t *ds2482, bool forzar_descubrimiento) {
-    static uint8_t ciclos_escaneo = 0;
-    ciclos_escaneo++;
-
-    ESP_LOGI(TAG, "--- Iniciando PING a jaulas conocidas ---");
-
-    // =================================================================
-    // FASE 1: PING LIVIANO A JAULAS CONOCIDAS (Se hace SIEMPRE)
-    // Match ROM + Read Memory 4 bytes — mínimo indispensable en bus.
-    // =================================================================
-    for (size_t i = 0; i < num_dispositivos; i++) {
-        esp_task_wdt_reset(); // scan largo con retries puede acercarse al timeout de 30s
-        if (dispositivos[i].asignado && dispositivos[i].ausencias < AUSENCIAS_PARAR_PING) {
-            ds2431_t esclavo_conocido = { .rom_code = dispositivos[i].rom };
-            uint8_t buffer[4];
-
-            esp_err_t err_ping = ds2431_read_memory(ds2482, &esclavo_conocido, 0x00, buffer, 4);
-
-            if (err_ping == ESP_OK && buffer[0] == DS2431_MAGIC_BYTE0 && buffer[1] == DS2431_MAGIC_BYTE1) {
-                dispositivos[i].presente = true;
-                dispositivos[i].ausencias = 0;
-
-                // Detectar si fue reprogramado por el Programador entre ciclos
-                uint16_t num_jaula = (uint16_t)buffer[2] | ((uint16_t)buffer[3] << 8);
-                char nueva_unidad[12];
-                generar_unidad(num_jaula, nueva_unidad);
-                if (strcmp(dispositivos[i].unidad, nueva_unidad) != 0) {
-                    strncpy(dispositivos[i].unidad, nueva_unidad, 11);
-                    dispositivos[i].unidad[11] = '\0';
-                    nvs_dirty = true;
-                    ESP_LOGW(TAG, "Unidad reprogramada: %s ahora es %s", dispositivos[i].rom_str, nueva_unidad);
-                }
-
-                ESP_LOGI(TAG, "PING OK: %s sigue conectada.", dispositivos[i].unidad);
-            } else {
-                if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
-                if (dispositivos[i].ausencias >= 3) dispositivos[i].presente = false;
-                ESP_LOGW(TAG, "PING FALLIDO: ROM %s no responde.", dispositivos[i].rom_str);
-            }
-            // Pausa entre pings: 50ms para bus de 80m (~4-8nF).
-            // El bus debe llegar a Vcc estable antes del siguiente reset.
-            vTaskDelay(pdMS_TO_TICKS(50));
+    // ── Fase 1: Agregar ROMs nuevos ───────────────────────────────────────────
+    for (size_t i = 0; i < found; i++) {
+        if (!rom_es_ds2431(roms[i])) continue;
+        char rom_str[17];
+        rom_to_string(roms[i], rom_str);
+        if (!existe_dispositivo_str(rom_str)) {
+            agregar_dispositivo(roms[i]);
+            nvs_dirty = true;
         }
     }
 
-    // =================================================================
-    // FASE 2: DESCUBRIMIENTO (cada 3 ciclos = 30s, o forzado)
-    // Se reduce de 6 a 3 para detectar esclavos nuevos más rápido.
-    // forzar_descubrimiento se activa cuando no hay ningún dispositivo
-    // registrado — así el primer esclavo conectado se detecta al instante.
-    // =================================================================
-    if (forzar_descubrimiento || ciclos_escaneo >= 3) {
-        ciclos_escaneo = 0;
-        esp_task_wdt_reset(); // Fase 2 puede tomar varios segundos con retries
-        ESP_LOGI(TAG, "--- Iniciando DESCUBRIMIENTO de nuevas jaulas ---");
-
-        uint64_t roms[MAX_DEVICES];
-        size_t found = 0;
-
-        esp_err_t err = ds2482_search_rom_all(roms, MAX_DEVICES, &found);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Search ROM reportó error. Jaulas encontradas: %zu", found);
-        }
-
+    // ── Fase 2: Actualizar presencia y (si aplica) leer EEPROM ───────────────
+    for (size_t j = 0; j < num_dispositivos; j++) {
+        bool encontrado = false;
         for (size_t i = 0; i < found; i++) {
-            if (!rom_es_ds2431(roms[i])) continue;
-
             char rom_str[17];
             rom_to_string(roms[i], rom_str);
-
-            if (!existe_dispositivo_str(rom_str)) {
-                // ── Dispositivo nuevo: agregar y leer EEPROM ──
-                ESP_LOGI(TAG, "NUEVA JAULA DETECTADA! ROM: %s", rom_str);
-                agregar_dispositivo(roms[i]);
-
-                ds2431_t esclavo_nuevo = { .rom_code = roms[i] };
-                ds2431_data_t datos_leidos;
-
-                if (ds2431_leer_datos(ds2482, &esclavo_nuevo, &datos_leidos) == ESP_OK && datos_leidos.valido) {
-                    for (size_t j = 0; j < num_dispositivos; j++) {
-                        if (dispositivos[j].rom == roms[i]) {
-                            strncpy(dispositivos[j].unidad, datos_leidos.unidad, 11);
-                            dispositivos[j].unidad[11] = '\0';
-                            dispositivos[j].asignado = true;
-                            dispositivos[j].presente = true;
-                            dispositivos[j].ausencias = 0;
-                            break;
-                        }
-                    }
-                }
-            } else {
-                // ── Dispositivo ya conocido ──
-                for (size_t j = 0; j < num_dispositivos; j++) {
-                    if (dispositivos[j].rom != roms[i]) continue;
-
-                    if (!dispositivos[j].asignado) {
-                        // Re-leer EEPROM por si el Programador lo grabó entre ciclos
-                        ds2431_t esclavo = { .rom_code = roms[i] };
-                        ds2431_data_t datos;
-                        if (ds2431_leer_datos(ds2482, &esclavo, &datos) == ESP_OK && datos.valido) {
-                            strncpy(dispositivos[j].unidad, datos.unidad, 11);
-                            dispositivos[j].unidad[11] = '\0';
-                            dispositivos[j].asignado = true;
-                            dispositivos[j].presente = true;
-                            dispositivos[j].ausencias = 0;
-                            nvs_dirty = true;
-                            ESP_LOGI(TAG, "Esclavo asignado: %s → %s", rom_str, datos.unidad);
-                        }
-                    } else if (dispositivos[j].ausencias > 0) {
-                        // Estaba marcado ausente pero el Search ROM lo encontró: reconectado.
-                        // Re-leer EEPROM para capturar reprogramación ocurrida durante la ausencia.
-                        ds2431_t esclavo_rc = { .rom_code = roms[i] };
-                        ds2431_data_t datos_rc;
-                        if (ds2431_leer_datos(ds2482, &esclavo_rc, &datos_rc) == ESP_OK && datos_rc.valido) {
-                            if (strcmp(dispositivos[j].unidad, datos_rc.unidad) != 0) {
-                                strncpy(dispositivos[j].unidad, datos_rc.unidad, 11);
-                                dispositivos[j].unidad[11] = '\0';
-                                nvs_dirty = true;
-                                ESP_LOGW(TAG, "Reprogramación al reconectar: %s → %s",
-                                         dispositivos[j].rom_str, datos_rc.unidad);
-                            }
-                        }
-                        dispositivos[j].presente = true;
-                        dispositivos[j].ausencias = 0;
-                        ESP_LOGI(TAG, "Jaula reconectada: %s", dispositivos[j].unidad);
-                    } else {
-                        // Asignada y siempre presente: verificar reprogramación cada ~30s (Phase 2).
-                        // No se hace en Phase 1 para no saturar el bus en cada ciclo de 10s.
-                        ds2431_t esclavo_chk = { .rom_code = roms[i] };
-                        ds2431_data_t datos_chk;
-                        if (ds2431_leer_datos(ds2482, &esclavo_chk, &datos_chk) == ESP_OK && datos_chk.valido) {
-                            if (strcmp(dispositivos[j].unidad, datos_chk.unidad) != 0) {
-                                ESP_LOGW(TAG, "Reprogramación detectada (Phase 2): %s → %s",
-                                         dispositivos[j].rom_str, datos_chk.unidad);
-                                strncpy(dispositivos[j].unidad, datos_chk.unidad, 11);
-                                dispositivos[j].unidad[11] = '\0';
-                                nvs_dirty = true;
-                            }
-                        }
-                    }
-                    break;
-                }
+            if (strcmp(dispositivos[j].rom_str, rom_str) == 0) {
+                encontrado = true;
+                break;
             }
         }
 
-        // ── Incrementar ausencias de dispositivos que Fase 2 tampoco encontró ──
-        // Cubre el caso donde Fase 1 los saltó (ausencias >= AUSENCIAS_PARAR_PING)
-        // y Search ROM tampoco los detecta: sin este bloque, ausencias se congela
-        // en AUSENCIAS_PARAR_PING y el dispositivo fantasma nunca es evictado.
-        for (size_t i = 0; i < num_dispositivos; i++) {
-            if (dispositivos[i].ausencias < AUSENCIAS_PARAR_PING) continue; // Fase 1 ya lo manejó
-            bool encontrado = false;
-            for (size_t k = 0; k < found; k++) {
-                if (dispositivos[i].rom == roms[k]) { encontrado = true; break; }
-            }
-            if (!encontrado) {
-                if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
-                if (dispositivos[i].ausencias >= 3) dispositivos[i].presente = false;
-            }
-        }
+        if (encontrado) {
+            if (dispositivos[j].ausencias > 0)
+                ESP_LOGI(TAG, "Jaula reconectada: %s", dispositivos[j].unidad[0]
+                         ? dispositivos[j].unidad : dispositivos[j].rom_str);
+            dispositivos[j].presente  = true;
+            dispositivos[j].ausencias = 0;
 
-        // ── Evictar dispositivos ausentes demasiado tiempo ──
-        // Se borran del array y de NVS. Si vuelven a conectarse en
-        // otro viaje, Phase 2 los re-agrega leyendo la EEPROM de nuevo.
-        size_t j = 0;
-        while (j < num_dispositivos) {
-            if (dispositivos[j].ausencias >= AUSENCIAS_EVICTAR) {
-                ESP_LOGW(TAG, "Descartando jaula ausente: %s (%s)",
-                         dispositivos[j].unidad[0] ? dispositivos[j].unidad : "SIN_ASIGNAR",
-                         dispositivos[j].rom_str);
-                memmove(&dispositivos[j], &dispositivos[j + 1],
-                        (num_dispositivos - j - 1) * sizeof(dispositivo_t));
-                num_dispositivos--;
-                nvs_dirty = true;
-            } else {
-                j++;
+            // Leer EEPROM si:
+            //   - Es un ciclo de lectura completa (cada 30s), O
+            //   - El dispositivo no tiene datos todavía
+            if (leer_eeprom || !dispositivos[j].asignado) {
+                leer_eeprom_dispositivo(ds2482, j);
+                // Pausa entre lecturas — el bus largo necesita recuperarse
+                vTaskDelay(pdMS_TO_TICKS(300));
             }
+        } else {
+            if (dispositivos[j].ausencias < 250) dispositivos[j].ausencias++;
+            if (dispositivos[j].ausencias >= 3)  dispositivos[j].presente = false;
         }
     }
 
-    // Guardar en flash solo si hubo cambios reales
-    if (nvs_dirty) {
-        guardar_en_nvs();
-        nvs_dirty = false;
+    // ── Fase 3: Evictar ausentes prolongados ─────────────────────────────────
+    size_t j = 0;
+    while (j < num_dispositivos) {
+        if (dispositivos[j].ausencias >= AUSENCIAS_EVICTAR) {
+            ESP_LOGW(TAG, "Evictando: %s (%s)",
+                     dispositivos[j].unidad[0] ? dispositivos[j].unidad : "SIN_ASIGNAR",
+                     dispositivos[j].rom_str);
+            memmove(&dispositivos[j], &dispositivos[j + 1],
+                    (num_dispositivos - j - 1) * sizeof(dispositivo_t));
+            num_dispositivos--;
+            nvs_dirty = true;
+        } else {
+            j++;
+        }
     }
 }
 
-// ============================================================
-// App_main con ciclo de escaneo mejorado
-// - Validación de Family Code en cada ROM detectado
-// - Log estructurado con estado de cada dispositivo
-// - Separación clara de lógica de escaneo en función propia
-// ============================================================
-// FUNCION MAIN --------------------------------------------------------------------------------------------
+// ── Publicar estado por MQTT ──────────────────────────────────────────────────
+void publicar_mqtt() {
+    cJSON *json = cJSON_CreateObject();
+    if (!json) { ESP_LOGE(TAG, "Fallo al crear JSON"); return; }
+
+    cJSON *jaulas_array = cJSON_AddArrayToObject(json, "jaulas");
+
+    for (size_t i = 0; i < num_dispositivos; i++) {
+        if (!dispositivos[i].presente) continue;
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(obj, "rom", dispositivos[i].rom_str);
+        if (dispositivos[i].asignado) {
+            cJSON_AddStringToObject(obj, "unidad", dispositivos[i].unidad);
+            cJSON_AddStringToObject(obj, "dolly",
+                                    dispositivos[i].tiene_dolly
+                                        ? dispositivos[i].unidad_dolly
+                                        : "SIN_DOLLY");
+        } else {
+            cJSON_AddStringToObject(obj, "unidad", "SIN_ASIGNAR");
+            cJSON_AddStringToObject(obj, "dolly",  "SIN_DOLLY");
+        }
+        cJSON_AddItemToArray(jaulas_array, obj);
+    }
+
+    char *json_str = cJSON_PrintUnformatted(json);
+    int msg_id = esp_mqtt_client_publish(mqtt_client, "GIO/IDJ", json_str, 0, 0, 0);
+    if (msg_id != -1) ESP_LOGI(TAG, "MQTT OK: %s", json_str);
+    else              ESP_LOGE(TAG, "Error publicando MQTT");
+
+    free(json_str);
+    cJSON_Delete(json);
+}
+
+// ── App main ──────────────────────────────────────────────────────────────────
 void app_main(void) {
     init_nvs_component();
     cargar_desde_nvs();
@@ -417,11 +342,11 @@ void app_main(void) {
     mqtt_app_start();
 
     i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = I2C_MASTER_SDA_IO,
+        .scl_io_num       = I2C_MASTER_SCL_IO,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
     i2c_param_config(I2C_MASTER_NUM, &conf);
@@ -429,139 +354,100 @@ void app_main(void) {
 
     ds2482_t ds2482;
     esp_err_t err = ds2482_init(&ds2482, I2C_MASTER_NUM, DS2482_I2C_ADDR);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "DS2482 no detectado en bus I2C — reiniciando en 5s");
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        esp_restart();
-    }
-    ESP_LOGI(TAG, "DS2482 inicializado correctamente");
+    if (err != ESP_OK) { ESP_LOGE(TAG, "DS2482 no detectado"); return; }
+    ESP_LOGI(TAG, "DS2482 OK");
 
-    // Activar Active Pullup en el DS2482 — crítico para cables largos
-    // Sin esto, la señal se degrada en los ~15m de cable por jaula
-    esp_err_t cfg_err = ds2482_configure(&ds2482, DS2482_CFG_APU);
-    if (cfg_err != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo configurar APU en DS2482 — señal puede degradarse en cables largos");
-        // No retornamos, el sistema puede seguir funcionando sin APU
-        // pero con mayor riesgo de errores en distancias largas
-    }
+    ds2482_configure(&ds2482, DS2482_CFG_APU);
 
-    // Watchdog: reinicia el ESP32 si el bus se traba y no alimentamos el WDT en 30s.
-    // Cubre el caso donde ds2482_busy_wait() se cuelga por I2C frozen o hardware fault.
+    // Watchdog 30s
     esp_task_wdt_config_t wdt_cfg = {
-        .timeout_ms    = 30000,   // 30s — cubre un ciclo de escaneo completo con margen
-        .idle_core_mask = 0,
-        .trigger_panic  = true,   // genera coredump + reset automático
+        .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true,
     };
-    if (esp_task_wdt_reconfigure(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
+    if (esp_task_wdt_reconfigure(&wdt_cfg) == ESP_ERR_INVALID_STATE)
         ESP_ERROR_CHECK(esp_task_wdt_init(&wdt_cfg));
-    }
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
-    ESP_LOGI(TAG, "Task WDT activo: timeout 30s");
 
+    // ── Descubrimiento inicial al arranque ────────────────────────────────────
+    // Espera que el bus se estabilice antes del primer escaneo
+    ESP_LOGI(TAG, "Estabilizando bus 1-Wire...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    ESP_LOGI(TAG, "=== DESCUBRIMIENTO INICIAL ===");
+    bool presence_boot = false;
+    ds2482_1wire_reset(&presence_boot);
+    if (presence_boot) {
+        escanear_dispositivos(&ds2482, true);  // Leer EEPROM completo al arranque
+    } else {
+        ESP_LOGW(TAG, "Bus vacío al arranque — esperando jaulas");
+    }
+    if (nvs_dirty) { guardar_en_nvs(); nvs_dirty = false; }
+    publicar_mqtt();
+
+    // ── Ciclo principal ───────────────────────────────────────────────────────
+    uint32_t ciclo      = 0;
     uint8_t errores_bus = 0;
-    bool bus_estuvo_vacio = false;
 
-while (1) {
-        esp_task_wdt_reset();   // alimentar watchdog: si no llegamos aquí en 30s → reset
+    while (1) {
+        esp_task_wdt_reset();
+        ciclo++;
 
         bool presence = false;
         err = ds2482_1wire_reset(&presence);
 
         if (err != ESP_OK) {
             errores_bus++;
-            ESP_LOGE(TAG, "Error en reset 1-Wire [%d/%d]", errores_bus, BUS_ERRORES_MAX);
+            ESP_LOGE(TAG, "Error reset 1-Wire [%d/%d]", errores_bus, BUS_ERRORES_MAX);
             if (errores_bus >= BUS_ERRORES_MAX) {
-                ESP_LOGE(TAG, "Bus 1-Wire irrecuperable — reiniciando ESP32...");
+                ESP_LOGE(TAG, "Bus irrecuperable — reiniciando");
                 esp_restart();
             }
-        } else {
-            errores_bus = 0;    // I2C + DS2482 respondieron: limpiar contador
-            if (!presence) {
-                bus_estuvo_vacio = true;
-                ESP_LOGW(TAG, "Bus vacío — ninguna jaula conectada");
-                for (size_t i = 0; i < num_dispositivos; i++) {
-                    if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
-                    if (dispositivos[i].ausencias >= 3) {
-                        dispositivos[i].presente = false;
-                    }
-                }
-            } else {
-                // Forzar Search ROM si: no hay dispositivos registrados,
-                // o el bus estuvo vacío (reconexión) — para redescubrir de inmediato.
-                bool forzar = (num_dispositivos == 0) || bus_estuvo_vacio;
-                bus_estuvo_vacio = false;
-                escanear_dispositivos(&ds2482, forzar);
-            }
+            vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL_MS));
+            continue;
         }
 
-        // ====================================================
-        // PANTALLA DEL CONDUCTOR (Datos en tiempo real)
-        // ====================================================
-        ESP_LOGI(TAG, "\n=============================================");
-        ESP_LOGI(TAG, "    JAULAS ACTUALMENTE ENGANCHADAS AL CAMIÓN ");
-        ESP_LOGI(TAG, "=============================================");
-        
-        int jaulas_enganchadas = 0;
-        for (size_t i = 0; i < num_dispositivos; i++) {
-            if (dispositivos[i].presente) {
-                jaulas_enganchadas++;
-                ESP_LOGI(TAG, "[ENGANCHADA] Unidad: %-12s | ROM: %s", 
-                    dispositivos[i].asignado ? dispositivos[i].unidad : "SIN ASIGNAR",
-                    dispositivos[i].rom_str);
-            }
-        }
-        
-        if (jaulas_enganchadas == 0) {
-            ESP_LOGI(TAG, "    >>> CAMIÓN SIN JAULAS <<<");
-        }
-        ESP_LOGI(TAG, "=============================================\n");
+        errores_bus = 0;
 
-        // ====================================================
-        // PUBLICACIÓN MQTT HACIA LA RASPBERRY PI
-        // ====================================================
-        cJSON *json = cJSON_CreateObject();
-        if (json != NULL) {
-            // Creamos un arreglo JSON llamado "jaulas"
-            cJSON *jaulas_array = cJSON_AddArrayToObject(json, "jaulas");
-
-            // Recorremos la tabla local
+        if (!presence) {
+            ESP_LOGW(TAG, "Bus vacío");
             for (size_t i = 0; i < num_dispositivos; i++) {
-                // SOLO agregamos las que están FÍSICAMENTE PRESENTES
-                if (dispositivos[i].presente) {
-                    cJSON *jaula_obj = cJSON_CreateObject();
-                    
-                    cJSON_AddStringToObject(jaula_obj, "rom", dispositivos[i].rom_str);
-                    
-                    // Si está asignada mandamos el código (ej. T0603-0230), si no, avisamos
-                    if (dispositivos[i].asignado) {
-                        cJSON_AddStringToObject(jaula_obj, "unidad", dispositivos[i].unidad);
-                    } else {
-                        cJSON_AddStringToObject(jaula_obj, "unidad", "SIN_ASIGNAR");
-                    }
-                    
-                    cJSON_AddItemToArray(jaulas_array, jaula_obj);
-                }
+                if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
+                if (dispositivos[i].ausencias >= 3)  dispositivos[i].presente = false;
             }
-
-            char *json_string = cJSON_PrintUnformatted(json);
-            if (json_string != NULL) {
-                int msg_id = esp_mqtt_client_publish(mqtt_client, "GIO/IDJ", json_string, 0, 0, 0);
-                if (msg_id != -1) {
-                    ESP_LOGI(TAG, "MQTT Publicado OK: %s", json_string);
-                } else {
-                    ESP_LOGE(TAG, "Error al publicar en MQTT");
-                }
-                free(json_string);
-            } else {
-                ESP_LOGE(TAG, "cJSON_PrintUnformatted falló — sin memoria");
-            }
-            cJSON_Delete(json);
         } else {
-            ESP_LOGE(TAG, "Fallo al crear el objeto JSON para MQTT");
+            // Cada 30s → escaneo completo con lectura de EEPROM
+            // Cada 3s  → solo presencia y ROMs nuevos
+            bool es_ciclo_eeprom = (ciclo % CICLOS_EEPROM == 0);
+            if (es_ciclo_eeprom)
+                ESP_LOGI(TAG, "=== ESCANEO COMPLETO (ciclo %lu) ===", ciclo);
+
+            escanear_dispositivos(&ds2482, es_ciclo_eeprom);
         }
 
-        // Esperar el intervalo de tiempo antes del próximo escaneo
-        vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL_MS));
+        if (nvs_dirty) { guardar_en_nvs(); nvs_dirty = false; }
 
-    } // <-- Cierre del while(1)
-} // <-- Cierre del app_main
+        // ── Display consola ───────────────────────────────────────────────────
+        ESP_LOGI(TAG, "============================================");
+        ESP_LOGI(TAG, "   JAULAS ENGANCHADAS | ciclo=%lu", ciclo);
+        ESP_LOGI(TAG, "============================================");
+        int enganchadas = 0;
+        for (size_t i = 0; i < num_dispositivos; i++) {
+            if (!dispositivos[i].presente) continue;
+            enganchadas++;
+            if (dispositivos[i].asignado) {
+                ESP_LOGI(TAG, "[OK] Jaula: %-12s | Dolly: %-12s | ROM: %s",
+                         dispositivos[i].unidad,
+                         dispositivos[i].tiene_dolly
+                             ? dispositivos[i].unidad_dolly : "N/A",
+                         dispositivos[i].rom_str);
+            } else {
+                ESP_LOGI(TAG, "[??] SIN ASIGNAR | ROM: %s", dispositivos[i].rom_str);
+            }
+        }
+        if (enganchadas == 0) ESP_LOGI(TAG, "   >>> SIN JAULAS <<<");
+        ESP_LOGI(TAG, "============================================\n");
+
+        publicar_mqtt();
+
+        vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL_MS));
+    }
+}

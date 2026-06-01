@@ -6,9 +6,9 @@
 
 #define TAG "DS2431"
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // CRC-16 (polinomio 0x8005, usado por DS2431)
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 uint16_t ds2431_crc16(const uint8_t *data, size_t len) {
     uint16_t crc = 0x0000;
     for (size_t i = 0; i < len; i++) {
@@ -20,35 +20,31 @@ uint16_t ds2431_crc16(const uint8_t *data, size_t len) {
     return crc;
 }
 
-// ─────────────────────────────────────────────
-// Match ROM: selecciona un esclavo específico
-// en el bus 1-Wire por su ROM de 64 bits.
-// Debe llamarse justo después de un reset 1-Wire.
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Match ROM — selecciona un esclavo por ROM de 64 bits
+// Tiempos extendidos para cable de ~80m (~4-8nF de capacitancia)
+// ─────────────────────────────────────────────────────────────────────────────
 esp_err_t ds2431_match_rom(ds2482_t *ds2482, ds2431_t *dev) {
     esp_err_t err;
     bool presence = false;
 
-    // Reintentar el reset hasta 3 veces — el DS2431 puede estar
-    // ocupado grabando cuando llega el reset entre bloques
+    // 3 reintentos con 30ms entre ellos — bus largo necesita más recuperación
     for (int intento = 0; intento < 3; intento++) {
         err = ds2482_1wire_reset(&presence);
         if (err == ESP_OK && presence) break;
-        vTaskDelay(pdMS_TO_TICKS(30));  // 30ms: bus de 80m necesita más tiempo entre reintentos
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
 
     if (err != ESP_OK || !presence) {
         ESP_LOGE(TAG, "No hay presencia 1-Wire en match ROM");
-        ds2482_reset(ds2482); 
-        ds2482_configure(ds2482, DS2482_CFG_APU); // Re-aplicar configuración
+        ds2482_reset(ds2482);
+        ds2482_configure(ds2482, DS2482_CFG_APU);
         return ESP_ERR_NOT_FOUND;
     }
 
-    // Enviar comando Match ROM
     err = ds2482_write_byte(OW_CMD_MATCH_ROM);
     if (err != ESP_OK) return err;
 
-    // Enviar los 8 bytes del ROM code LSB primero
     uint8_t *rom_bytes = (uint8_t *)&dev->rom_code;
     for (int i = 0; i < 8; i++) {
         err = ds2482_write_byte(rom_bytes[i]);
@@ -61,36 +57,27 @@ esp_err_t ds2431_match_rom(ds2482_t *ds2482, ds2431_t *dev) {
     return ESP_OK;
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Write Scratchpad
-// El DS2431 exige escribir en bloques de 8 bytes
-// alineados. addr debe ser múltiplo de 8.
-// El DS2482 devuelve el byte E/S (ES) que necesita
-// Copy Scratchpad para confirmar la escritura.
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 esp_err_t ds2431_write_scratchpad(ds2482_t *ds2482, ds2431_t *dev,
                                    uint16_t addr, const uint8_t *data, size_t len) {
-    esp_err_t err;
-
     if (len == 0 || len > 8) {
         ESP_LOGE(TAG, "Write Scratchpad: len debe ser 1–8 bytes, recibido %d", len);
         return ESP_ERR_INVALID_ARG;
     }
 
-    err = ds2431_match_rom(ds2482, dev);
+    esp_err_t err = ds2431_match_rom(ds2482, dev);
     if (err != ESP_OK) return err;
 
-    // Comando Write Scratchpad
     err = ds2482_write_byte(DS2431_CMD_WRITE_SCRATCHPAD);
     if (err != ESP_OK) return err;
 
-    // Dirección destino (TA1 = LSB, TA2 = MSB)
     err = ds2482_write_byte((uint8_t)(addr & 0xFF));
     if (err != ESP_OK) return err;
     err = ds2482_write_byte((uint8_t)(addr >> 8));
     if (err != ESP_OK) return err;
 
-    // Datos
     for (size_t i = 0; i < len; i++) {
         err = ds2482_write_byte(data[i]);
         if (err != ESP_OK) {
@@ -103,34 +90,24 @@ esp_err_t ds2431_write_scratchpad(ds2482_t *ds2482, ds2431_t *dev,
     return ESP_OK;
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Read Scratchpad
-// Verifica que lo que se escribió en el scratchpad
-// coincide antes de hacer el Copy (commit).
-// Devuelve addr_es = dirección + byte ES para
-// pasarle a Copy Scratchpad.
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 esp_err_t ds2431_read_scratchpad(ds2482_t *ds2482, ds2431_t *dev,
                                   uint16_t *addr_es, uint8_t *data, size_t len) {
-    esp_err_t err;
-
-    err = ds2431_match_rom(ds2482, dev);
+    esp_err_t err = ds2431_match_rom(ds2482, dev);
     if (err != ESP_OK) return err;
 
     err = ds2482_write_byte(DS2431_CMD_READ_SCRATCHPAD);
     if (err != ESP_OK) return err;
 
-    // Leer TA1, TA2 (dirección) y ES (byte de estado/offset)
     uint8_t ta1, ta2, es;
     err = ds2482_read_byte(&ta1); if (err != ESP_OK) return err;
     err = ds2482_read_byte(&ta2); if (err != ESP_OK) return err;
     err = ds2482_read_byte(&es);  if (err != ESP_OK) return err;
 
-    if (addr_es) {
-        *addr_es = (uint16_t)ta1 | ((uint16_t)ta2 << 8);
-    }
+    if (addr_es) *addr_es = (uint16_t)ta1 | ((uint16_t)ta2 << 8);
 
-    // Leer los datos del scratchpad
     for (size_t i = 0; i < len; i++) {
         err = ds2482_read_byte(&data[i]);
         if (err != ESP_OK) {
@@ -143,48 +120,34 @@ esp_err_t ds2431_read_scratchpad(ds2482_t *ds2482, ds2431_t *dev,
     return ESP_OK;
 }
 
-// ─────────────────────────────────────────────
-// Copy Scratchpad — hace el commit a EEPROM
-// CRÍTICO: addr y es_byte deben coincidir
-// exactamente con lo que devolvió Read Scratchpad.
-// El DS2431 necesita ~10ms para grabar.
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Copy Scratchpad — commit a EEPROM
+// ─────────────────────────────────────────────────────────────────────────────
 esp_err_t ds2431_copy_scratchpad(ds2482_t *ds2482, ds2431_t *dev,
                                   uint16_t addr, uint8_t es_byte) {
-    esp_err_t err;
-
-    // 1. Seleccionamos el esclavo
-    err = ds2431_match_rom(ds2482, dev);
+    esp_err_t err = ds2431_match_rom(ds2482, dev);
     if (err != ESP_OK) return err;
-    // 2. Enviamos comando Copy
+
     err = ds2482_write_byte(DS2431_CMD_COPY_SCRATCHPAD);
     if (err != ESP_OK) return err;
 
-    // 3. Enviamos los bytes de validación
     err = ds2482_write_byte((uint8_t)(addr & 0xFF)); if (err != ESP_OK) return err;
     err = ds2482_write_byte((uint8_t)(addr >> 8));   if (err != ESP_OK) return err;
     err = ds2482_write_byte(es_byte);                if (err != ESP_OK) return err;
 
-    // Log para diagnóstico — ver qué bytes llegan durante el polling
     ESP_LOGI(TAG, "Copy Scratchpad addr=0x%02X es=0x%02X — iniciando polling", addr, es_byte);
-
-// 4. ESPERA PASIVA (Punto 3): 
-    // En lugar de hacer polling en el bus, dejamos que el chip trabaje en silencio.
-    // El DS2431 tarda 10ms máximo; usamos 15ms por seguridad en ambiente ruidoso.
-    vTaskDelay(pdMS_TO_TICKS(15)); 
-
+    // Espera pasiva: 15ms cubre el máx del DS2431 con margen para ambiente ruidoso
+    vTaskDelay(pdMS_TO_TICKS(15));
 
     return ESP_OK;
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Read Memory — lectura directa de EEPROM
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 esp_err_t ds2431_read_memory(ds2482_t *ds2482, ds2431_t *dev,
                               uint16_t addr, uint8_t *data, size_t len) {
-    esp_err_t err;
-
-    err = ds2431_match_rom(ds2482, dev);
+    esp_err_t err = ds2431_match_rom(ds2482, dev);
     if (err != ESP_OK) return err;
 
     err = ds2482_write_byte(DS2431_CMD_READ_MEMORY);
@@ -204,128 +167,158 @@ esp_err_t ds2431_read_memory(ds2482_t *ds2482, ds2431_t *dev,
     return ESP_OK;
 }
 
-// ─────────────────────────────────────────────
-// API alto nivel: escribir datos IDJ en EEPROM
-// Escribe en bloques de 8 bytes (requerimiento DS2431)
-// con verificación de scratchpad antes de cada commit.
-// ─────────────────────────────────────────────
-esp_err_t ds2431_escribir_datos(ds2482_t *ds2482, ds2431_t *dev, const ds2431_data_t *datos) {
-    // 1. AUMENTAR EL BUFFER A 24 BYTES (Múltiplo de 8)
-    uint8_t buf[24]; 
-    memset(buf, 0x00, sizeof(buf)); // Todo inicializado en ceros
+// ─────────────────────────────────────────────────────────────────────────────
+// API alto nivel: escribir datos IDJ v2 (jaula + dolly opcional)
+// Nota: el maestro normalmente NO escribe EEPROM, pero se mantiene
+// sincronizado con el programador por si se requiere en el futuro.
+// Tiempos extendidos para cable de 80m.
+// ─────────────────────────────────────────────────────────────────────────────
+esp_err_t ds2431_escribir_datos(ds2482_t *ds2482, ds2431_t *dev,
+                                 const ds2431_data_t *datos) {
+    uint8_t buf[DS2431_EEPROM_BUF_LEN];
+    memset(buf, 0x00, sizeof(buf));
 
-    // --- Preparación de datos ---
-    buf[0] = DS2431_MAGIC_BYTE0; 
-    buf[1] = DS2431_MAGIC_BYTE1;
-    buf[2] = (uint8_t)(datos->numero_jaula & 0xFF);
-    buf[3] = (uint8_t)(datos->numero_jaula >> 8);
-    strncpy((char *)&buf[4], datos->unidad, 11);
-    
-    // Timestamp (dirección 0x10 a 0x13)
-    buf[16] = (uint8_t)(datos->timestamp & 0xFF);
-    buf[17] = (uint8_t)((datos->timestamp >> 8) & 0xFF);
-    buf[18] = (uint8_t)((datos->timestamp >> 16) & 0xFF);
-    buf[19] = (uint8_t)((datos->timestamp >> 24) & 0xFF);
-    
-    // Calcular CRC de los primeros 20 bytes
-    uint16_t crc = ds2431_crc16(buf, 20);
-    buf[20] = (uint8_t)(crc & 0xFF);
-    buf[21] = (uint8_t)(crc >> 8);
-    
-    // buf[22] y buf[23] se quedan en 0x00 como relleno (Padding)
+    // Magic
+    buf[DS2431_ADDR_MAGIC]     = DS2431_MAGIC_BYTE0;
+    buf[DS2431_ADDR_MAGIC + 1] = DS2431_MAGIC_BYTE1;
 
-    // 2. FIJAR EL TOTAL EN 24 BYTES
-    size_t total = 24; 
+    // Jaula
+    buf[DS2431_ADDR_JAULA]     = (uint8_t)(datos->numero_jaula & 0xFF);
+    buf[DS2431_ADDR_JAULA + 1] = (uint8_t)(datos->numero_jaula >> 8);
+    memcpy(&buf[DS2431_ADDR_UNIDAD_JAULA], datos->unidad_jaula, 12);
+
+    // Dolly
+    buf[DS2431_ADDR_DOLLY]     = (uint8_t)(datos->numero_dolly & 0xFF);
+    buf[DS2431_ADDR_DOLLY + 1] = (uint8_t)(datos->numero_dolly >> 8);
+    if (datos->tiene_dolly && datos->numero_dolly > 0) {
+        memcpy(&buf[DS2431_ADDR_UNIDAD_DOLLY], datos->unidad_dolly, 12);
+    }
+
+    // Timestamp
+    buf[DS2431_ADDR_TIMESTAMP]     = (uint8_t)(datos->timestamp & 0xFF);
+    buf[DS2431_ADDR_TIMESTAMP + 1] = (uint8_t)((datos->timestamp >> 8)  & 0xFF);
+    buf[DS2431_ADDR_TIMESTAMP + 2] = (uint8_t)((datos->timestamp >> 16) & 0xFF);
+    buf[DS2431_ADDR_TIMESTAMP + 3] = (uint8_t)((datos->timestamp >> 24) & 0xFF);
+
+    // CRC-16 sobre 36 bytes (0x00–0x23)
+    uint16_t crc = ds2431_crc16(buf, DS2431_CRC_DATA_LEN);
+    buf[DS2431_ADDR_CRC16]     = (uint8_t)(crc & 0xFF);
+    buf[DS2431_ADDR_CRC16 + 1] = (uint8_t)(crc >> 8);
+
+    // Escribir 5 bloques de 8 bytes con tiempos extendidos para 80m
     size_t pos = 0;
-
-    while (pos < total) {
-        // 3. EL TAMAÑO DE BLOQUE AHORA SIEMPRE ES 8
-        size_t tam_bloque = 8; 
+    while (pos < DS2431_EEPROM_BUF_LEN) {
         uint16_t addr = (uint16_t)pos;
 
-        // Reset de bridge antes de cada bloque — 15ms para bus de 80m
+        // Reset del bridge — 15ms para bus de 80m
         ds2482_1wire_reset(&(bool){false});
         vTaskDelay(pdMS_TO_TICKS(15));
 
-        // Escribir Scratchpad
-        esp_err_t err = ds2431_write_scratchpad(ds2482, dev, addr, &buf[pos], tam_bloque);
+        esp_err_t err = ds2431_write_scratchpad(ds2482, dev, addr, &buf[pos], 8);
         if (err != ESP_OK) return err;
 
-        // Leer Scratchpad para verificar antes de hacer el copy
+        // Verificar scratchpad
         uint8_t ta1, ta2, es_byte;
         uint8_t verify[8];
         err = ds2431_match_rom(ds2482, dev);
         if (err != ESP_OK) return err;
         err = ds2482_write_byte(DS2431_CMD_READ_SCRATCHPAD);
         if (err != ESP_OK) return err;
-        err = ds2482_read_byte(&ta1);  if (err != ESP_OK) return err;
-        err = ds2482_read_byte(&ta2);  if (err != ESP_OK) return err;
+        err = ds2482_read_byte(&ta1);     if (err != ESP_OK) return err;
+        err = ds2482_read_byte(&ta2);     if (err != ESP_OK) return err;
         err = ds2482_read_byte(&es_byte); if (err != ESP_OK) return err;
-        for (int i = 0; i < (int)tam_bloque; i++) {
+        for (int i = 0; i < 8; i++) {
             err = ds2482_read_byte(&verify[i]);
             if (err != ESP_OK) return err;
         }
 
-        if (memcmp(&buf[pos], verify, tam_bloque) != 0) {
-            ESP_LOGE(TAG, "Error de validacion scratchpad en 0x%02X", addr);
+        if (memcmp(&buf[pos], verify, 8) != 0) {
+            ESP_LOGE(TAG, "Validación scratchpad falló en 0x%02X", addr);
             return ESP_ERR_INVALID_RESPONSE;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20));  // 20ms: bus de 80m necesita más margen antes del copy
+        // 20ms antes del copy — margen extra para bus largo
+        vTaskDelay(pdMS_TO_TICKS(20));
 
-        // Copiar a EEPROM
         err = ds2431_copy_scratchpad(ds2482, dev, addr, es_byte);
         if (err != ESP_OK) return err;
 
         ESP_LOGI(TAG, "Bloque 0x%02X grabado OK", addr);
-
-        pos += tam_bloque;
-        vTaskDelay(pdMS_TO_TICKS(40)); // 40ms entre bloques: enfriamiento EEPROM + bus recovery
+        pos += 8;
+        // 40ms entre bloques: enfriamiento EEPROM + recovery bus 80m
+        vTaskDelay(pdMS_TO_TICKS(40));
     }
+
     return ESP_OK;
 }
 
-// ─────────────────────────────────────────────
-// API alto nivel: leer y validar datos IDJ
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// API alto nivel: leer y validar datos IDJ v2
+//
+// Detecta formato antiguo v1 (CRC en 0x14) e informa que requiere
+// reprogramación con el IDJ Programador actualizado.
+// ─────────────────────────────────────────────────────────────────────────────
 esp_err_t ds2431_leer_datos(ds2482_t *ds2482, ds2431_t *dev,
                              ds2431_data_t *datos) {
-    uint8_t buf[DS2431_EEPROM_DATA_LEN];
+    uint8_t buf[DS2431_EEPROM_BUF_LEN];
     memset(datos, 0, sizeof(ds2431_data_t));
 
-    esp_err_t err = ds2431_read_memory(ds2482, dev, 0x00, buf, sizeof(buf));
+    esp_err_t err = ds2431_read_memory(ds2482, dev, 0x00, buf, DS2431_EEPROM_BUF_LEN);
     if (err != ESP_OK) return err;
 
-    // Verificar magic number
+    // Verificar magic
     if (buf[0] != DS2431_MAGIC_BYTE0 || buf[1] != DS2431_MAGIC_BYTE1) {
-        ESP_LOGW(TAG, "EEPROM virgen o no programada (magic=0x%02X%02X)", buf[0], buf[1]);
+        ESP_LOGW(TAG, "EEPROM virgen (magic=0x%02X%02X)", buf[0], buf[1]);
         datos->valido = false;
-        return ESP_OK;  // No es error, simplemente no está asignada
+        return ESP_OK;
     }
 
-    // Verificar CRC-16
-    uint16_t crc_leido    = (uint16_t)buf[20] | ((uint16_t)buf[21] << 8);
-    uint16_t crc_calculado = ds2431_crc16(buf, 20);
+    // Verificar CRC v2 (36 bytes, CRC en 0x24)
+    uint16_t crc_leido     = (uint16_t)buf[DS2431_ADDR_CRC16]
+                           | ((uint16_t)buf[DS2431_ADDR_CRC16 + 1] << 8);
+    uint16_t crc_calculado = ds2431_crc16(buf, DS2431_CRC_DATA_LEN);
 
     if (crc_leido != crc_calculado) {
-        ESP_LOGE(TAG, "CRC inválido: leído=0x%04X calculado=0x%04X — datos corruptos",
-                 crc_leido, crc_calculado);
+        // Detectar si es formato antiguo v1 (CRC sobre 20 bytes en 0x14)
+        uint16_t crc_v1_leido     = (uint16_t)buf[0x14] | ((uint16_t)buf[0x15] << 8);
+        uint16_t crc_v1_calculado = ds2431_crc16(buf, 20);
+
+        if (crc_v1_leido == crc_v1_calculado) {
+            ESP_LOGW(TAG, "EEPROM con formato ANTIGUO (v1) — esclavo requiere reprogramación");
+        } else {
+            ESP_LOGE(TAG, "CRC inválido: leído=0x%04X calculado=0x%04X — datos corruptos",
+                     crc_leido, crc_calculado);
+        }
         datos->valido = false;
         return ESP_ERR_INVALID_CRC;
     }
 
-    // Parsear datos
-    datos->numero_jaula = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
-    memcpy(datos->unidad, &buf[4], 12);
-    datos->unidad[11]   = '\0';
-    datos->timestamp    = (uint32_t)buf[16]
-                        | ((uint32_t)buf[17] << 8)
-                        | ((uint32_t)buf[18] << 16)
-                        | ((uint32_t)buf[19] << 24);
-    datos->valido       = true;
+    // Parsear jaula
+    datos->numero_jaula = (uint16_t)buf[DS2431_ADDR_JAULA]
+                        | ((uint16_t)buf[DS2431_ADDR_JAULA + 1] << 8);
+    memcpy(datos->unidad_jaula, &buf[DS2431_ADDR_UNIDAD_JAULA], 12);
+    datos->unidad_jaula[11] = '\0';
 
-    ESP_LOGI(TAG, "EEPROM OK — Jaula #%d unidad '%s' timestamp %lu",
-             datos->numero_jaula, datos->unidad, datos->timestamp);
+    // Parsear dolly
+    datos->numero_dolly = (uint16_t)buf[DS2431_ADDR_DOLLY]
+                        | ((uint16_t)buf[DS2431_ADDR_DOLLY + 1] << 8);
+    datos->tiene_dolly  = (datos->numero_dolly > 0);
+    if (datos->tiene_dolly) {
+        memcpy(datos->unidad_dolly, &buf[DS2431_ADDR_UNIDAD_DOLLY], 12);
+        datos->unidad_dolly[11] = '\0';
+    }
+
+    // Parsear timestamp
+    datos->timestamp = (uint32_t)buf[DS2431_ADDR_TIMESTAMP]
+                     | ((uint32_t)buf[DS2431_ADDR_TIMESTAMP + 1] << 8)
+                     | ((uint32_t)buf[DS2431_ADDR_TIMESTAMP + 2] << 16)
+                     | ((uint32_t)buf[DS2431_ADDR_TIMESTAMP + 3] << 24);
+
+    datos->valido = true;
+
+    ESP_LOGI(TAG, "EEPROM OK — Jaula #%d '%s' | Dolly %s",
+             datos->numero_jaula, datos->unidad_jaula,
+             datos->tiene_dolly ? datos->unidad_dolly : "N/A");
 
     return ESP_OK;
 }
