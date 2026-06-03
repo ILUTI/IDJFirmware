@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-GIO - IDJ Programador v5
-reTerminal 1280x720 — selección desde API, pantalla táctil
+GIO - IDJ Programador v7
+- Pantalla WiFi integrada (escanea redes, muestra lista, pide contraseña)
+- Cache JSON local para usar sin internet
+- Auto-descarga la API al arrancar + botón manual
+reTerminal 1280×720 — pantalla táctil
 """
 
 import tkinter as tk
@@ -10,9 +13,11 @@ import threading
 import queue
 import re
 import json
+import os
 import subprocess
 import urllib.request
 import urllib.error
+from datetime import datetime
 from bleak import BleakScanner, BleakClient
 
 # ─── APIs ─────────────────────────────────────────────────────────────────────
@@ -20,6 +25,12 @@ API_JAULAS  = ("https://mcubackend.launion.com.gt/api/flujo/412/ejecutar/"
                "?public_key=YKlo4Q8yNNzVsgTGfJFUE5p0ZocgGmkL&responseIdentifier=1")
 API_DOLLIES = ("https://mcubackend.launion.com.gt/api/flujo/411/ejecutar/"
                "?public_key=YKlo4Q8yNNzVsgTGfJFUE5p0ZocgGmkL&responseIdentifier=1")
+
+# ─── Cache local ──────────────────────────────────────────────────────────────
+CACHE_DIR     = os.path.expanduser("~/.idj_cache")
+CACHE_JAULAS  = os.path.join(CACHE_DIR, "jaulas.json")
+CACHE_DOLLIES = os.path.join(CACHE_DIR, "dollies.json")
+CACHE_META    = os.path.join(CACHE_DIR, "meta.json")
 
 # ─── BLE UUIDs ────────────────────────────────────────────────────────────────
 CHAR_JAULA  = "0000a0b4-0000-1000-8000-00805f9b34fb"
@@ -70,7 +81,7 @@ class BLEManager:
     def programar(self, j, d): self._go(self._programar(j, d))
 
     async def _scan(self):
-        self._push("status", ("Escaneando...", YELLOW))
+        self._push("status", ("Escaneando BLE...", YELLOW))
         try:
             devices = await BleakScanner.discover(timeout=5.0)
             idj = [d for d in devices if d.name and "IDJ" in d.name.upper()]
@@ -124,18 +135,17 @@ class BLEManager:
 # ─── Aplicación ───────────────────────────────────────────────────────────────
 class App(tk.Tk):
 
-    # ── Medidas de layout ─────────────────────────────────────────────────────
     HDR_H   = 65
     SB_H    = 55
     BODY_Y  = 65
-    BODY_H  = H - 65 - 55    # 600px
-    LEFT_W  = 488             # panel izquierdo
-    SEP_X   = LEFT_W + 2      # 490
-    RIGHT_X = LEFT_W + 4      # 492 — inicio panel derecho
-    RIGHT_W = W - LEFT_W - 4  # 788px
-    TAB_H   = 50              # alto de las pestañas
-    FILT_W  = 308             # ancho del área de filtro/numpad
-    LIST_X  = RIGHT_X + FILT_W + 4   # inicio de la lista
+    BODY_H  = H - 65 - 55
+    LEFT_W  = 488
+    SEP_X   = LEFT_W + 2
+    RIGHT_X = LEFT_W + 4
+    RIGHT_W = W - LEFT_W - 4
+    TAB_H   = 50
+    FILT_W  = (W - LEFT_W - 4) // 2
+    LIST_X  = RIGHT_X + FILT_W + 4
 
     def __init__(self):
         super().__init__()
@@ -152,22 +162,19 @@ class App(tk.Tk):
         self.devices = []
         self.sel_dev = None
 
-        # BLE state
-        self.var_cur_jaula = tk.StringVar(value="—")
-        self.var_cur_dolly = tk.StringVar(value="—")
-        self.var_status    = tk.StringVar(value="Presiona ESCANEAR para buscar el IDJ Programador")
-        self.var_ble_info  = tk.StringVar(value="Sin conexión")
-
-        # Selección desde API
-        self.selected_jaula   = None   # {"CODIGO", "num", "MODELO"}
-        self.selected_dolly   = None
-        self.tab              = "jaula"
-        self.filtro           = ""
-        self.jaulas_api       = []
-        self.dollies_api      = []
-        self.lista_filtrada   = []
-        self.api_cargada      = False
-
+        # BLE / programación
+        self.var_cur_jaula     = tk.StringVar(value="—")
+        self.var_cur_dolly     = tk.StringVar(value="—")
+        self.var_status        = tk.StringVar(value="Iniciando...")
+        self.var_ble_info      = tk.StringVar(value="Sin conexión")
+        self.selected_jaula    = None
+        self.selected_dolly    = None
+        self.tab               = "jaula"
+        self.filtro            = ""
+        self.jaulas_api        = []
+        self.dollies_api       = []
+        self.lista_filtrada    = []
+        self.api_cargada       = False
         self.var_sel_jaula     = tk.StringVar(value="Sin seleccionar")
         self.var_sel_jaula_mod = tk.StringVar(value="")
         self.var_sel_dolly     = tk.StringVar(value="Sin dolly")
@@ -176,22 +183,50 @@ class App(tk.Tk):
         self.var_lista_titulo  = tk.StringVar(value="Jaulas disponibles")
         self.var_count         = tk.StringVar(value="")
 
+        # Cache / API status
+        self.var_ultima_act = tk.StringVar(value="Sin datos guardados")
+
+        # WiFi state
+        self.redes_wifi   = []     # lista de redes escaneadas
+        self.sel_red      = None   # red seleccionada {"ssid", "signal", "segura"}
+        self.pwd_chars    = []     # caracteres de la contraseña
+        self.pwd_visible  = False
+        self.caps_on      = False
+        self.var_pwd_disp = tk.StringVar(value="")
+        self.var_red_sel  = tk.StringVar(value="Selecciona una red de la lista")
+        self.var_wifi_msg = tk.StringVar(value="")
+        self.var_wifi_act = tk.StringVar(value="")
+
+        # Cargar cache al arrancar
+        ts = self._cargar_cache()
+        if ts:
+            self.var_ultima_act.set(f"Guardado: {ts}")
+            self.var_status.set(f"Datos locales cargados ({ts})")
+        else:
+            self.var_status.set("Sin datos locales — conecta a internet y presiona Actualizar")
+
         self._build()
         self._show("conn")
         self._poll()
+
+        # Auto-actualizar API silenciosamente 3s después de arrancar
+        self.after(3000, self._actualizar_api_silencioso)
 
     # ─── Navegación ───────────────────────────────────────────────────────────
     def _build(self):
         self.scr_conn = tk.Frame(self, bg=BG)
         self.scr_prog = tk.Frame(self, bg=BG)
-        for s in (self.scr_conn, self.scr_prog):
+        self.scr_wifi = tk.Frame(self, bg=BG)
+        for s in (self.scr_conn, self.scr_prog, self.scr_wifi):
             s.place(x=0, y=0, width=W, height=H)
         self._build_conn(self.scr_conn)
         self._build_prog(self.scr_prog)
+        self._build_wifi(self.scr_wifi)
 
     def _show(self, name):
-        if name == "conn": self.scr_conn.tkraise()
-        else:              self.scr_prog.tkraise()
+        {"conn": self.scr_conn,
+         "prog": self.scr_prog,
+         "wifi": self.scr_wifi}[name].tkraise()
 
     # =========================================================================
     # PANTALLA 1 — CONEXIÓN BLE
@@ -225,7 +260,6 @@ class App(tk.Tk):
         tk.Label(card, text="Dispositivos IDJ encontrados:",
                  bg=PANEL, fg=GRAY2,
                  font=("Arial", 14, "bold")).place(x=50, y=202)
-
         lf = tk.Frame(card, bg=CARD)
         lf.place(x=50, y=230, width=700, height=120)
         self.lbox = tk.Listbox(lf, bg=CARD, fg=WHITE,
@@ -241,7 +275,7 @@ class App(tk.Tk):
                                   x=200, y=368, w=400, h=72,
                                   font=("Arial", 19, "bold"))
 
-        # ── Configuración del dispositivo ──────────────────────────────────
+        # ── Configuración ──────────────────────────────────────────────────
         tk.Frame(card, bg=CARD, height=2).place(x=40, y=462, width=720, height=2)
         tk.Label(card, text="Configuración del dispositivo",
                  bg=PANEL, fg=GRAY, font=("Arial", 12)).place(x=50, y=473)
@@ -255,20 +289,34 @@ class App(tk.Tk):
                                 x=405, y=498, w=195, h=50,
                                 font=("Arial", 13, "bold"))
 
+        # ── Estado API / cache ──────────────────────────────────────────────
         sb = tk.Frame(p, bg=PANEL, height=55)
         sb.place(x=0, y=H - 55, width=W, height=55)
         tk.Label(sb, text="Estado:", bg=PANEL, fg=GRAY,
-                 font=("Arial", 13)).place(x=20, y=16)
+                 font=("Arial", 13)).place(x=20, y=8)
         self.lbl_s1 = tk.Label(sb, textvariable=self.var_status,
                                 bg=PANEL, fg=GREEN,
-                                font=("Arial", 13, "bold"))
-        self.lbl_s1.place(x=90, y=16)
+                                font=("Arial", 12, "bold"))
+        self.lbl_s1.place(x=90, y=8)
+
+        # Última actualización API
+        self.lbl_ultima_act = tk.Label(sb, textvariable=self.var_ultima_act,
+                                       bg=PANEL, fg=GRAY2,
+                                       font=("Arial", 11))
+        self.lbl_ultima_act.place(x=W - 320, y=10)
+
+        self._btn(sb, "↻ Actualizar API",
+                  TEAL, self._cargar_api,
+                  x=W - 170, y=8, w=155, h=38,
+                  font=("Arial", 11, "bold"))
 
     # =========================================================================
-    # PANTALLA 2 — PROGRAMACIÓN
+    # PANTALLA 2 — PROGRAMACIÓN (igual que v6)
     # =========================================================================
     def _build_prog(self, p):
-        # Header
+        body_y = self.BODY_Y
+        body_h = self.BODY_H
+
         hdr = tk.Frame(p, bg=PANEL, height=self.HDR_H)
         hdr.place(x=0, y=0, width=W, height=self.HDR_H)
         self._btn(hdr, "←  VOLVER", CARD, self._on_volver,
@@ -281,14 +329,11 @@ class App(tk.Tk):
         tk.Label(hdr, textvariable=self.var_ble_info,
                  bg=PANEL, fg=GRAY2, font=("Arial", 12)).place(x=W - 272, y=22)
 
-        # Separador vertical entre paneles
-        tk.Frame(p, bg=CARD).place(x=self.SEP_X, y=self.BODY_Y,
-                                   width=2, height=self.BODY_H)
+        tk.Frame(p, bg=CARD).place(x=self.SEP_X, y=body_y, width=2, height=body_h)
 
         self._build_left(p)
         self._build_right(p)
 
-        # Status bar
         sb = tk.Frame(p, bg=PANEL, height=self.SB_H)
         sb.place(x=0, y=H - self.SB_H, width=W, height=self.SB_H)
         tk.Label(sb, text="Estado:", bg=PANEL, fg=GRAY,
@@ -298,19 +343,15 @@ class App(tk.Tk):
                                 font=("Arial", 13, "bold"))
         self.lbl_s2.place(x=90, y=16)
 
-    # ── Panel izquierdo ───────────────────────────────────────────────────────
     def _build_left(self, p):
-        FW   = self.LEFT_W - 8    # ancho útil del formulario
-        FX   = 8
-        BY   = self.BODY_Y
+        FW = self.LEFT_W - 8
+        FX = 8
+        BY = self.BODY_Y
 
-        # Card: estado actual
         st = tk.Frame(p, bg=PANEL)
         st.place(x=FX, y=BY + 8, width=FW, height=205)
-
         tk.Label(st, text="ESCLAVO CONECTADO — ESTADO ACTUAL",
-                 bg=PANEL, fg=GRAY2,
-                 font=("Arial", 10, "bold")).place(x=10, y=8)
+                 bg=PANEL, fg=GRAY2, font=("Arial", 10, "bold")).place(x=10, y=8)
 
         cw = (FW - 28) // 2
         jc = tk.Frame(st, bg=CARD); jc.place(x=10, y=28, width=cw, height=115)
@@ -330,46 +371,36 @@ class App(tk.Tk):
         self._btn(st, "↻   LEER EEPROM", BLUE, self._on_leer,
                   x=10, y=150, w=FW-20, h=46, font=("Arial", 13, "bold"))
 
-        # Separador
         tk.Frame(p, bg=CARD).place(x=FX, y=BY+220, width=FW, height=2)
 
-        # Card: A PROGRAMAR
         ap = tk.Frame(p, bg=PANEL)
         ap.place(x=FX, y=BY+228, width=FW, height=275)
-
         tk.Label(ap, text="A PROGRAMAR",
-                 bg=PANEL, fg=GRAY2,
-                 font=("Arial", 10, "bold")).place(x=10, y=8)
+                 bg=PANEL, fg=GRAY2, font=("Arial", 10, "bold")).place(x=10, y=8)
 
-        # Jaula seleccionada
         jsel = tk.Frame(ap, bg=CARD); jsel.place(x=10, y=30, width=FW-20, height=98)
         tk.Label(jsel, text="Jaula",
                  bg=CARD, fg=GRAY2, font=("Arial", 11)).place(x=10, y=6)
         self.lbl_sel_jaula = tk.Label(jsel, textvariable=self.var_sel_jaula,
                                       bg=CARD, fg=GRAY2,
-                                      font=("Arial", 22, "bold"),
-                                      anchor="w")
+                                      font=("Arial", 22, "bold"), anchor="w")
         self.lbl_sel_jaula.place(x=10, y=28)
         tk.Label(jsel, textvariable=self.var_sel_jaula_mod,
-                 bg=CARD, fg=GRAY, font=("Arial", 10)).place(x=10, y=68)
+                 bg=CARD, fg=WHITE, font=("Arial", 12)).place(x=10, y=68)
 
-        # Dolly seleccionado
         dsel = tk.Frame(ap, bg=CARD); dsel.place(x=10, y=138, width=FW-20, height=98)
         tk.Label(dsel, text="Dolly",
                  bg=CARD, fg=GRAY2, font=("Arial", 11)).place(x=10, y=6)
         self.lbl_sel_dolly = tk.Label(dsel, textvariable=self.var_sel_dolly,
                                       bg=CARD, fg=GRAY2,
-                                      font=("Arial", 22, "bold"),
-                                      anchor="w")
+                                      font=("Arial", 22, "bold"), anchor="w")
         self.lbl_sel_dolly.place(x=10, y=28)
         tk.Label(dsel, textvariable=self.var_sel_dolly_mod,
-                 bg=CARD, fg=GRAY, font=("Arial", 10)).place(x=10, y=68)
+                 bg=CARD, fg=WHITE, font=("Arial", 12)).place(x=10, y=68)
 
-        # Botones PROGRAMAR / LIMPIAR
         BY2 = BY + 228 + 275 + 6
         BW_PROG = int((FW - 14) * 0.65)
         BW_LIMP = FW - 14 - BW_PROG - 10
-
         self.btn_prog = self._btn(p, "▶  PROGRAMAR",
                                   ORANGE, self._on_programar,
                                   x=FX+2, y=BY2, w=BW_PROG, h=62,
@@ -379,17 +410,12 @@ class App(tk.Tk):
                   x=FX+2+BW_PROG+10, y=BY2, w=BW_LIMP, h=62,
                   font=("Arial", 12, "bold"))
 
-    # ── Panel derecho — selector con API ──────────────────────────────────────
     def _build_right(self, p):
-        RX = self.RIGHT_X
-        RY = self.BODY_Y
-        RW = self.RIGHT_W
-        TH = self.TAB_H
-        FW = self.FILT_W
-        LX = self.LIST_X
+        RX = self.RIGHT_X; RY = self.BODY_Y
+        RW = self.RIGHT_W; TH = self.TAB_H
+        FW = self.FILT_W;  LX = self.LIST_X
         LW = W - LX - 5
 
-        # ── Pestañas ──────────────────────────────────────────────────────────
         tw = RW // 2
         self.btn_tab_j = self._btn(p, "⬜  JAULAS",
                                    BLUE, lambda: self._set_tab("jaula"),
@@ -400,18 +426,14 @@ class App(tk.Tk):
                                    x=RX+tw, y=RY, w=tw, h=TH,
                                    font=("Arial", 14, "bold"))
 
-        CY = RY + TH   # y inicio del contenido
-
-        # ── Sub-separador vertical (filtro | lista) ───────────────────────────
+        CY = RY + TH
         tk.Frame(p, bg=CARD).place(x=RX+FW+2, y=CY, width=2,
                                    height=self.BODY_H - TH)
 
-        # ── Área de filtro + numpad ───────────────────────────────────────────
         tk.Label(p, text="FILTRAR POR NÚMERO:",
                  bg=BG, fg=GRAY2,
                  font=("Arial", 10, "bold")).place(x=RX+8, y=CY+10)
 
-        # Display del filtro
         fd = tk.Frame(p, bg=BLUE, padx=2, pady=2)
         fd.place(x=RX+8, y=CY+32, width=FW-16, height=52)
         tk.Label(fd, textvariable=self.var_filtro,
@@ -419,8 +441,7 @@ class App(tk.Tk):
                  font=("Arial", 28, "bold"),
                  anchor="e", padx=10).pack(fill="both", expand=True)
 
-        # Numpad pequeño para filtrar
-        NB_W, NB_H, NB_G = 86, 66, 6
+        NB_W, NB_H, NB_G = 116, 76, 8
         NB_TOTAL_W = 3*NB_W + 2*NB_G
         NB_OX = RX + (FW - NB_TOTAL_W)//2
         NB_OY = CY + 94
@@ -438,31 +459,24 @@ class App(tk.Tk):
             elif txt == "✕": cmd = self._on_filtro_clear
             else:             cmd = lambda t=txt: self._on_filtro_digit(t)
             tk.Button(p, text=txt, bg=color, fg=WHITE,
-                      font=("Arial", 20, "bold"),
-                      relief="flat",
+                      font=("Arial", 24, "bold"), relief="flat",
                       activebackground=BLUE, activeforeground=WHITE,
                       command=cmd).place(x=bx, y=by, width=NB_W, height=NB_H)
 
-        # Botón "SIN DOLLY" (solo visible en tab dollies)
         NB_BOTTOM_Y = NB_OY + 4*(NB_H+NB_G)
         self.btn_sin_dolly = tk.Button(
-            p, text="○  SIN DOLLY",
-            bg=PURPLE, fg=WHITE,
-            font=("Arial", 13, "bold"),
-            relief="flat",
+            p, text="○  SIN DOLLY", bg=PURPLE, fg=WHITE,
+            font=("Arial", 13, "bold"), relief="flat",
             activebackground=WHITE, activeforeground=BG,
             command=self._on_sin_dolly)
-        self.btn_sin_dolly.place(x=NB_OX, y=NB_BOTTOM_Y,
-                                 width=NB_TOTAL_W, height=50)
-        self.btn_sin_dolly.place_forget()   # oculto hasta que sea tab dolly
+        self.btn_sin_dolly.place(x=NB_OX, y=NB_BOTTOM_Y, width=NB_TOTAL_W, height=50)
+        self.btn_sin_dolly.place_forget()
 
-        # Botón actualizar API
         self._btn(p, "↻ Actualizar lista",
                   TEAL, self._cargar_api,
                   x=RX+8, y=CY+self.BODY_H-TH-52, w=FW-16, h=44,
                   font=("Arial", 11, "bold"))
 
-        # ── Lista ─────────────────────────────────────────────────────────────
         tk.Label(p, textvariable=self.var_lista_titulo,
                  bg=BG, fg=GRAY2,
                  font=("Arial", 11, "bold")).place(x=LX+6, y=CY+10)
@@ -470,27 +484,187 @@ class App(tk.Tk):
                  bg=BG, fg=GRAY,
                  font=("Arial", 10)).place(x=LX+6, y=CY+30)
 
-        # Scrollbar + listbox
         lf = tk.Frame(p, bg=CARD)
-        lf.place(x=LX+4, y=CY+52, width=LW-4,
-                 height=self.BODY_H - TH - 56)
-
+        lf.place(x=LX+4, y=CY+52, width=LW-4, height=self.BODY_H - TH - 56)
         sb_list = tk.Scrollbar(lf, orient="vertical", bg=CARD,
                                troughcolor=CARD, activebackground=BLUE)
         sb_list.pack(side="right", fill="y")
-
         self.lbox_api = tk.Listbox(
             lf, bg=CARD, fg=WHITE,
             selectbackground=BLUE, selectforeground=WHITE,
-            font=("Arial", 14), borderwidth=0,
-            highlightthickness=0, activestyle="none",
+            # ─── TAMAÑO DE LETRA DE LA LISTA ──────────────────────────────
+            # Cambia el número: 18=pequeño  22=mediano  26=grande
+            font=("Arial", 40),
+            # ──────────────────────────────────────────────────────────────
+            borderwidth=0, highlightthickness=0, activestyle="none",
             yscrollcommand=sb_list.set)
         self.lbox_api.pack(side="left", fill="both", expand=True, padx=4, pady=4)
         sb_list.config(command=self.lbox_api.yview)
         self.lbox_api.bind("<<ListboxSelect>>", self._on_api_select)
+        self.lbox_api.insert("end", "  Cargando datos...")
 
-        # Mensaje inicial
-        self.lbox_api.insert("end", "  Cargando datos de la API...")
+    # =========================================================================
+    # PANTALLA 3 — CONFIGURACIÓN WIFI
+    # =========================================================================
+    def _build_wifi(self, p):
+        # Header
+        hdr = tk.Frame(p, bg=PANEL, height=65)
+        hdr.place(x=0, y=0, width=W, height=65)
+        self._btn(hdr, "←  VOLVER", CARD, lambda: self._show("conn"),
+                  x=15, y=12, w=140, h=42, font=("Arial", 13, "bold"))
+        tk.Label(hdr, text="GIO  ·  CONFIGURACIÓN WIFI",
+                 bg=PANEL, fg=WHITE,
+                 font=("Arial", 19, "bold")).place(x=175, y=18)
+
+        # Red activa en el header
+        self.lbl_wifi_act = tk.Label(hdr, textvariable=self.var_wifi_act,
+                                     bg=PANEL, fg=GREEN, font=("Arial", 12))
+        self.lbl_wifi_act.place(x=W - 320, y=22)
+
+        # ── Panel izquierdo — lista de redes ──────────────────────────────
+        LW = 460
+        tk.Label(p, text="REDES DISPONIBLES",
+                 bg=BG, fg=GRAY2,
+                 font=("Arial", 11, "bold")).place(x=15, y=78)
+
+        self._btn(p, "⟳  ESCANEAR REDES", BLUE, self._on_escanear_wifi,
+                  x=15, y=100, w=430, h=58, font=("Arial", 14, "bold"))
+
+        lf_wifi = tk.Frame(p, bg=CARD)
+        lf_wifi.place(x=15, y=168, width=430, height=480)
+        sb_wifi = tk.Scrollbar(lf_wifi, orient="vertical", bg=CARD,
+                               troughcolor=CARD, activebackground=BLUE)
+        sb_wifi.pack(side="right", fill="y")
+        self.lbox_wifi = tk.Listbox(
+            lf_wifi, bg=CARD, fg=WHITE,
+            selectbackground=BLUE, selectforeground=WHITE,
+            font=("Arial", 17), borderwidth=0,
+            highlightthickness=0, activestyle="none",
+            yscrollcommand=sb_wifi.set)
+        self.lbox_wifi.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        sb_wifi.config(command=self.lbox_wifi.yview)
+        self.lbox_wifi.bind("<<ListboxSelect>>", self._on_red_select)
+
+        # ── Separador vertical ─────────────────────────────────────────────
+        tk.Frame(p, bg=CARD).place(x=455, y=65, width=2, height=600)
+
+        # ── Panel derecho — contraseña y teclado ──────────────────────────
+        RX = 465
+
+        # Red seleccionada
+        red_card = tk.Frame(p, bg=PANEL)
+        red_card.place(x=RX, y=68, width=810, height=68)
+        tk.Label(red_card, text="Red seleccionada:",
+                 bg=PANEL, fg=GRAY2, font=("Arial", 11)).place(x=12, y=8)
+        tk.Label(red_card, textvariable=self.var_red_sel,
+                 bg=PANEL, fg=WHITE,
+                 font=("Arial", 16, "bold")).place(x=12, y=32)
+
+        # Campo contraseña
+        tk.Label(p, text="Contraseña:",
+                 bg=BG, fg=GRAY2, font=("Arial", 12)).place(x=RX+8, y=146)
+
+        pwd_frame = tk.Frame(p, bg=BLUE, padx=2, pady=2)
+        pwd_frame.place(x=RX+8, y=168, width=700, height=58)
+        self.lbl_pwd = tk.Label(pwd_frame,
+                                textvariable=self.var_pwd_disp,
+                                bg=CARD, fg=WHITE,
+                                font=("Arial", 24, "bold"),
+                                anchor="w", padx=12)
+        self.lbl_pwd.pack(fill="both", expand=True)
+
+        # Botón mostrar/ocultar
+        self.btn_eye = self._btn(p, "👁", CARD, self._on_toggle_pwd,
+                                 x=RX+718, y=168, w=58, h=58,
+                                 font=("Arial", 16))
+
+        # ── Teclado QWERTY ────────────────────────────────────────────────
+        self._build_teclado_wifi(p, x=RX+8, y=238)
+
+        # Botones conectar / limpiar
+        self.btn_conectar_wifi = self._btn(
+            p, "✓  CONECTAR A RED", GREEN, self._on_conectar_wifi,
+            x=RX+8, y=620, w=480, h=55, font=("Arial", 15, "bold"))
+        self._btn(p, "✕ Borrar contraseña", CARD, self._on_borrar_pwd,
+                  x=RX+500, y=620, w=278, h=55, font=("Arial", 13, "bold"))
+
+        # Status bar
+        sb = tk.Frame(p, bg=PANEL, height=45)
+        sb.place(x=0, y=H - 45, width=W, height=45)
+        self.lbl_wifi_msg = tk.Label(sb, textvariable=self.var_wifi_msg,
+                                     bg=PANEL, fg=GREEN,
+                                     font=("Arial", 13, "bold"))
+        self.lbl_wifi_msg.place(x=20, y=10)
+
+    def _build_teclado_wifi(self, p, x, y):
+        """Teclado QWERTY táctil para ingreso de contraseña WiFi."""
+        KW, KH, KG = 70, 52, 5  # ancho, alto, gap por tecla
+
+        filas = [
+            ['1','2','3','4','5','6','7','8','9','0','-','_'],
+            ['q','w','e','r','t','y','u','i','o','p'],
+            ['a','s','d','f','g','h','j','k','l'],
+            ['z','x','c','v','b','n','m','.','@','#'],
+        ]
+
+        for r, fila in enumerate(filas):
+            row_w = len(fila) * (KW + KG) - KG
+            ox = x + (800 - row_w) // 2
+            for c, ch in enumerate(fila):
+                bx = ox + c * (KW + KG)
+                by = y + r * (KH + KG)
+                tk.Button(p, text=ch.upper() if self.caps_on else ch,
+                          bg=CARD, fg=WHITE,
+                          font=("Arial", 14, "bold"), relief="flat",
+                          activebackground=BLUE, activeforeground=WHITE,
+                          command=lambda k=ch: self._on_tecla(k)
+                          ).place(x=bx, y=by, width=KW, height=KH)
+
+        # Fila especial
+        ey = y + 4 * (KH + KG)
+        especiales = [
+            ("⇧ CAPS", 120, TEAL,   self._on_caps),
+            ("ESPACIO", 280, CARD,   lambda: self._on_tecla(' ')),
+            ("!",       70,  CARD,   lambda: self._on_tecla('!')),
+            ("%",       70,  CARD,   lambda: self._on_tecla('%')),
+            ("←",      80,  YELLOW, self._on_backspace_wifi),
+        ]
+        ex = x + 10
+        for (txt, w, color, cmd) in especiales:
+            tk.Button(p, text=txt, bg=color, fg=WHITE,
+                      font=("Arial", 13, "bold"), relief="flat",
+                      activebackground=BLUE, activeforeground=WHITE,
+                      command=cmd).place(x=ex, y=ey, width=w, height=KH)
+            ex += w + KG
+
+        # Guardar referencias para actualizar mayúsculas
+        self._teclado_parent = p
+        self._teclado_x      = x
+        self._teclado_y      = y
+        self._teclado_kw     = KW
+        self._teclado_kh     = KH
+        self._teclado_kg     = KG
+        self._teclado_filas  = filas
+
+    def _actualizar_teclado_caps(self):
+        """Actualiza el texto de las teclas cuando cambia CAPS."""
+        KW = self._teclado_kw; KH = self._teclado_kh; KG = self._teclado_kg
+        p = self._teclado_parent
+        x = self._teclado_x;   y = self._teclado_y
+
+        for r, fila in enumerate(self._teclado_filas):
+            row_w = len(fila) * (KW + KG) - KG
+            ox = x + (800 - row_w) // 2
+            for c, ch in enumerate(fila):
+                bx = ox + c * (KW + KG)
+                by = y + r * (KH + KG)
+                # Buscar el widget en esa posición y actualizar texto
+                for w in p.place_slaves():
+                    info = w.place_info()
+                    if (int(info.get('x', -1)) == bx and
+                            int(info.get('y', -1)) == by):
+                        w.config(text=ch.upper() if self.caps_on else ch)
+                        break
 
     # ─── Helper botón ─────────────────────────────────────────────────────────
     def _btn(self, parent, text, color, cmd, x, y, w, h, font=None):
@@ -502,37 +676,51 @@ class App(tk.Tk):
         b.place(x=x, y=y, width=w, height=h)
         return b
 
-    # ─── Pestañas ─────────────────────────────────────────────────────────────
-    def _set_tab(self, tab):
-        self.tab    = tab
-        self.filtro = ""
-        self.var_filtro.set("")
+    # ─── Cache JSON ───────────────────────────────────────────────────────────
+    def _cargar_cache(self):
+        """Carga jaulas y dollies desde archivos JSON. Devuelve timestamp o ''."""
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            if os.path.exists(CACHE_JAULAS):
+                with open(CACHE_JAULAS, 'r', encoding='utf-8') as f:
+                    self.jaulas_api = json.load(f)
+            if os.path.exists(CACHE_DOLLIES):
+                with open(CACHE_DOLLIES, 'r', encoding='utf-8') as f:
+                    self.dollies_api = json.load(f)
+            if os.path.exists(CACHE_META):
+                with open(CACHE_META, 'r') as f:
+                    meta = json.load(f)
+                    return meta.get("ultima_actualizacion", "")
+        except Exception:
+            pass
+        return ""
 
-        if tab == "jaula":
-            self.btn_tab_j.config(bg=BLUE)
-            self.btn_tab_d.config(bg=CARD)
-            self.var_lista_titulo.set("Jaulas disponibles")
-            self.btn_sin_dolly.place_forget()
-        else:
-            self.btn_tab_d.config(bg=BLUE)
-            self.btn_tab_j.config(bg=CARD)
-            self.var_lista_titulo.set("Dollies disponibles")
-            # Mostrar botón SIN DOLLY — recalcular posición
-            NB_W, NB_H, NB_G = 86, 66, 6
-            NB_TOTAL_W = 3*NB_W + 2*NB_G
-            NB_OX = self.RIGHT_X + (self.FILT_W - NB_TOTAL_W)//2
-            NB_BOTTOM_Y = (self.BODY_Y + self.TAB_H + 94) + 4*(NB_H+NB_G)
-            self.btn_sin_dolly.place(x=NB_OX, y=NB_BOTTOM_Y,
-                                     width=NB_TOTAL_W, height=50)
-
-        self._actualizar_lista()
+    def _guardar_cache(self, jaulas, dollies):
+        """Guarda las listas en disco para uso offline."""
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(CACHE_JAULAS, 'w', encoding='utf-8') as f:
+                json.dump(jaulas, f, ensure_ascii=False, indent=2)
+            with open(CACHE_DOLLIES, 'w', encoding='utf-8') as f:
+                json.dump(dollies, f, ensure_ascii=False, indent=2)
+            ts = datetime.now().strftime("%d/%m/%Y %H:%M")
+            with open(CACHE_META, 'w') as f:
+                json.dump({"ultima_actualizacion": ts}, f)
+            return ts
+        except Exception:
+            return ""
 
     # ─── API ──────────────────────────────────────────────────────────────────
     def _cargar_api(self):
+        """Descarga la API y guarda en cache. Muestra progreso."""
         self._set_status("Consultando API...", YELLOW)
         self.lbox_api.delete(0, "end")
         self.lbox_api.insert("end", "  Consultando API, espera...")
         threading.Thread(target=self._fetch_thread, daemon=True).start()
+
+    def _actualizar_api_silencioso(self):
+        """Intenta actualizar la API al arrancar sin mostrar errores si falla."""
+        threading.Thread(target=self._fetch_thread_silencioso, daemon=True).start()
 
     def _fetch_thread(self):
         try:
@@ -540,10 +728,27 @@ class App(tk.Tk):
             d = self._fetch(API_DOLLIES)
             if j is not None: self.jaulas_api  = j
             if d is not None: self.dollies_api = d
-            self.api_cargada = True
-            self.ui_q.put({"tipo": "api_ok", "datos": None})
+            if j and d:
+                ts = self._guardar_cache(j, d)
+                self.api_cargada = True
+                self.ui_q.put({"tipo": "api_ok", "datos": ts})
+            else:
+                self.ui_q.put({"tipo": "api_error", "datos": "Respuesta vacía"})
         except Exception as e:
             self.ui_q.put({"tipo": "api_error", "datos": str(e)})
+
+    def _fetch_thread_silencioso(self):
+        try:
+            j = self._fetch(API_JAULAS)
+            d = self._fetch(API_DOLLIES)
+            if j and d:
+                self.jaulas_api  = j
+                self.dollies_api = d
+                ts = self._guardar_cache(j, d)
+                self.api_cargada = True
+                self.ui_q.put({"tipo": "api_ok_silencioso", "datos": ts})
+        except Exception:
+            pass  # Sin internet — usa cache, sin error visible
 
     def _fetch(self, url):
         req = urllib.request.Request(url, headers={"User-Agent": "IDJ-App/1.0"})
@@ -554,7 +759,6 @@ class App(tk.Tk):
     def _actualizar_lista(self):
         lista = self.jaulas_api if self.tab == "jaula" else self.dollies_api
         f = self.filtro
-
         filtrada = []
         for item in lista:
             codigo = item.get("CODIGO", "")
@@ -562,58 +766,44 @@ class App(tk.Tk):
             num_part = partes[1] if len(partes) > 1 else codigo
             if not f or f in num_part:
                 filtrada.append(item)
-
         self.lista_filtrada = filtrada
         self.lbox_api.delete(0, "end")
-
         if not lista:
             self.lbox_api.insert("end", "  Sin datos — presiona ↻ Actualizar lista")
             self.var_count.set("")
             return
-
         for item in filtrada:
-            codigo = item.get("CODIGO", "")
-            modelo = (item.get("MODELO") or "").strip()
-            nome   = (item.get("NOME") or "").strip()[:28]
-            self.lbox_api.insert(
-                "end", f"  {codigo}   •   {modelo}   {nome}")
-
-        total = len(lista)
-        shown = len(filtrada)
+            self.lbox_api.insert("end", f"   {item.get('CODIGO', '')}")
         self.var_count.set(
-            f"{shown} de {total}" if f else f"{total} equipos")
+            f"{len(filtrada)} de {len(lista)}" if f else f"{len(lista)} equipos")
 
     def _on_api_select(self, _):
         sel = self.lbox_api.curselection()
         if not sel or not self.lista_filtrada: return
         idx = sel[0]
         if idx >= len(self.lista_filtrada): return
-
         item   = self.lista_filtrada[idx]
         codigo = item.get("CODIGO", "")
         partes = codigo.split("-")
-        num_str = partes[1] if len(partes) > 1 else "0"
-        num    = int(num_str)
+        num    = int(partes[1]) if len(partes) > 1 else 0
         modelo = (item.get("MODELO") or "").strip()
-
-        entry = {"CODIGO": codigo, "num": num, "MODELO": modelo}
-
+        nome   = (item.get("NOME")   or "").strip()
+        entry  = {"CODIGO": codigo, "num": num, "MODELO": modelo, "NOME": nome}
         if self.tab == "jaula":
             self.selected_jaula = entry
             self.var_sel_jaula.set(codigo)
-            self.var_sel_jaula_mod.set(modelo)
+            self.var_sel_jaula_mod.set(nome)
             self.lbl_sel_jaula.config(fg=GREEN)
             self._set_status(f"Jaula seleccionada: {codigo}", GREEN)
-            # Auto-pasar a tab dolly
             self.after(300, lambda: self._set_tab("dolly"))
         else:
             self.selected_dolly = entry
             self.var_sel_dolly.set(codigo)
-            self.var_sel_dolly_mod.set(modelo)
+            self.var_sel_dolly_mod.set(nome)
             self.lbl_sel_dolly.config(fg=BLUE)
             self._set_status(f"Dolly seleccionado: {codigo}", GREEN)
 
-    # ─── Filtro numpad ────────────────────────────────────────────────────────
+    # ─── Filtro ───────────────────────────────────────────────────────────────
     def _on_filtro_digit(self, d):
         if len(self.filtro) < 4:
             self.filtro += d
@@ -631,6 +821,27 @@ class App(tk.Tk):
         self.var_filtro.set("")
         self._actualizar_lista()
 
+    def _set_tab(self, tab):
+        self.tab    = tab
+        self.filtro = ""
+        self.var_filtro.set("")
+        if tab == "jaula":
+            self.btn_tab_j.config(bg=BLUE)
+            self.btn_tab_d.config(bg=CARD)
+            self.var_lista_titulo.set("Jaulas disponibles")
+            self.btn_sin_dolly.place_forget()
+        else:
+            self.btn_tab_d.config(bg=BLUE)
+            self.btn_tab_j.config(bg=CARD)
+            self.var_lista_titulo.set("Dollies disponibles")
+            NB_W, NB_H, NB_G = 116, 76, 8
+            NB_TOTAL_W = 3*NB_W + 2*NB_G
+            NB_OX = self.RIGHT_X + (self.FILT_W - NB_TOTAL_W)//2
+            NB_BOTTOM_Y = (self.BODY_Y + self.TAB_H + 94) + 4*(NB_H+NB_G)
+            self.btn_sin_dolly.place(x=NB_OX, y=NB_BOTTOM_Y,
+                                     width=NB_TOTAL_W, height=50)
+        self._actualizar_lista()
+
     def _on_sin_dolly(self):
         self.selected_dolly = None
         self.var_sel_dolly.set("Sin dolly")
@@ -638,7 +849,141 @@ class App(tk.Tk):
         self.lbl_sel_dolly.config(fg=GRAY2)
         self._set_status("Sin dolly — solo se programará la jaula", YELLOW)
 
-    # ─── Callbacks BLE ────────────────────────────────────────────────────────
+    # ─── WiFi: escaneo y conexión ─────────────────────────────────────────────
+    def _on_escanear_wifi(self):
+        self.lbox_wifi.delete(0, "end")
+        self.lbox_wifi.insert("end", "  Escaneando redes...")
+        self.var_wifi_msg.set("Escaneando redes WiFi...")
+        self.lbl_wifi_msg.config(fg=YELLOW)
+        threading.Thread(target=self._escanear_thread, daemon=True).start()
+
+    def _escanear_thread(self):
+        try:
+            result = subprocess.run(
+                ['nmcli', '--terse', '--fields',
+                 'SSID,SIGNAL,SECURITY', 'device', 'wifi', 'list', '--rescan', 'yes'],
+                capture_output=True, text=True, timeout=15)
+            redes = []
+            vistas = set()
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip(): continue
+                # Último campo es SECURITY, el anterior SIGNAL (número)
+                # Todo lo anterior es SSID (puede contener :)
+                partes = line.rsplit(':', 2)
+                if len(partes) < 2: continue
+                ssid     = partes[0].replace('\\:', ':').strip()
+                signal   = partes[1].strip() if len(partes) > 1 else "0"
+                security = partes[2].strip() if len(partes) > 2 else ""
+                if not ssid or ssid == '--' or ssid in vistas: continue
+                vistas.add(ssid)
+                redes.append({"ssid": ssid, "signal": signal,
+                              "segura": bool(security)})
+            # Ordenar por señal descendente
+            redes.sort(key=lambda r: int(r["signal"]) if r["signal"].isdigit() else 0,
+                       reverse=True)
+            self.ui_q.put({"tipo": "wifi_scan_ok", "datos": redes})
+        except Exception as e:
+            self.ui_q.put({"tipo": "wifi_scan_error", "datos": str(e)})
+
+    def _on_red_select(self, _):
+        sel = self.lbox_wifi.curselection()
+        if not sel or not self.redes_wifi: return
+        idx = sel[0]
+        if idx >= len(self.redes_wifi): return
+        self.sel_red = self.redes_wifi[idx]
+        ssid = self.sel_red["ssid"]
+        segura = self.sel_red["segura"]
+        self.var_red_sel.set(f"{ssid}  {'🔒' if segura else '🔓 Red abierta'}")
+        self.pwd_chars = []
+        self.var_pwd_disp.set("")
+        if not segura:
+            self.var_wifi_msg.set("Red abierta — presiona CONECTAR sin contraseña")
+            self.lbl_wifi_msg.config(fg=YELLOW)
+
+    def _on_tecla(self, ch):
+        if self.caps_on and ch.isalpha():
+            ch = ch.upper()
+        self.pwd_chars.append(ch)
+        self._refrescar_pwd()
+
+    def _on_caps(self):
+        self.caps_on = not self.caps_on
+        self._actualizar_teclado_caps()
+
+    def _on_backspace_wifi(self):
+        if self.pwd_chars:
+            self.pwd_chars.pop()
+            self._refrescar_pwd()
+
+    def _on_borrar_pwd(self):
+        self.pwd_chars = []
+        self._refrescar_pwd()
+
+    def _on_toggle_pwd(self):
+        self.pwd_visible = not self.pwd_visible
+        self._refrescar_pwd()
+        self.btn_eye.config(fg=GREEN if self.pwd_visible else WHITE)
+
+    def _refrescar_pwd(self):
+        pwd = ''.join(self.pwd_chars)
+        if self.pwd_visible:
+            self.var_pwd_disp.set(pwd)
+        else:
+            self.var_pwd_disp.set('●' * len(self.pwd_chars))
+
+    def _on_conectar_wifi(self):
+        if not self.sel_red:
+            self.var_wifi_msg.set("⚠  Selecciona una red de la lista primero")
+            self.lbl_wifi_msg.config(fg=YELLOW)
+            return
+        ssid = self.sel_red["ssid"]
+        pwd  = ''.join(self.pwd_chars)
+        self.var_wifi_msg.set(f"Conectando a {ssid}...")
+        self.lbl_wifi_msg.config(fg=YELLOW)
+        threading.Thread(
+            target=self._conectar_thread,
+            args=(ssid, pwd),
+            daemon=True).start()
+
+    def _conectar_thread(self, ssid, pwd):
+        try:
+            cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid]
+            if pwd:
+                cmd += ['password', pwd]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            exito = ('successfully activated' in result.stdout.lower() or
+                     'ya está conectado' in result.stdout.lower() or
+                     'already connected' in result.stdout.lower())
+            self.ui_q.put({"tipo": "wifi_connect_ok" if exito else "wifi_connect_fail",
+                           "datos": ssid})
+        except Exception as e:
+            self.ui_q.put({"tipo": "wifi_connect_fail", "datos": str(e)})
+
+    def _get_wifi_actual(self):
+        try:
+            result = subprocess.run(
+                ['nmcli', '-t', '-f', 'DEVICE,STATE,CONNECTION', 'device', 'status'],
+                capture_output=True, text=True, timeout=5)
+            for line in result.stdout.strip().split('\n'):
+                if 'wifi' in line.lower() and ':connected:' in line.lower():
+                    return line.split(':')[2]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _barras_senal(signal_str):
+        try:
+            s = int(signal_str)
+        except Exception:
+            return "░░░░"
+        if s >= 80: return "████"
+        if s >= 60: return "███░"
+        if s >= 40: return "██░░"
+        if s >= 20: return "█░░░"
+        return "░░░░"
+
+    # ─── BLE / programación callbacks ─────────────────────────────────────────
     def _on_scan(self):
         self.lbox.delete(0, "end")
         self.devices = []
@@ -679,25 +1024,21 @@ class App(tk.Tk):
         self.lbl_sel_dolly.config(fg=GRAY2)
         self._set_tab("jaula")
 
-    # ─── Configuración WiFi / Bluetooth ───────────────────────────────────────
     def _on_wifi(self):
-        try:
-            subprocess.Popen(['lxterminal', '-e', 'nmtui'],
-                             start_new_session=True)
-        except Exception:
-            try:
-                subprocess.Popen(['x-terminal-emulator', '-e', 'nmtui'],
-                                 start_new_session=True)
-            except Exception as e:
-                self._set_status(f"Abre una terminal y corre: nmtui", YELLOW)
+        # Mostrar red activa en el header de WiFi
+        red_actual = self._get_wifi_actual()
+        self.var_wifi_act.set(
+            f"Conectado a: {red_actual}" if red_actual else "Sin conexión WiFi")
+        self._show("wifi")
+        # Auto-escanear al abrir
+        self.after(300, self._on_escanear_wifi)
 
     def _on_bt_toggle(self):
         try:
             result = subprocess.run(
                 ['bluetoothctl', 'show'], capture_output=True, text=True)
             powered = 'Powered: yes' in result.stdout
-            subprocess.run(['bluetoothctl', 'power',
-                            'off' if powered else 'on'])
+            subprocess.run(['bluetoothctl', 'power', 'off' if powered else 'on'])
             if powered:
                 self.btn_bt.config(bg=GRAY, text="⚡ Bluetooth OFF")
                 self._set_status("Bluetooth apagado", GRAY)
@@ -710,8 +1051,8 @@ class App(tk.Tk):
     # ─── Helpers ──────────────────────────────────────────────────────────────
     def _set_status(self, msg, color=GREEN):
         self.var_status.set(msg)
-        self.lbl_s1.config(fg=color)
-        self.lbl_s2.config(fg=color)
+        for lbl in (self.lbl_s1, self.lbl_s2):
+            lbl.config(fg=color)
 
     # ─── Parser notificaciones BLE ────────────────────────────────────────────
     def _parse_notify(self, msg):
@@ -726,27 +1067,23 @@ class App(tk.Tk):
                     self.var_cur_jaula.set(f"T0603-{int(m.group(1)):04d}")
                     dv = m.group(2)
                     self.var_cur_dolly.set(
-                        "Sin dolly" if dv in ("NONE", "0")
+                        "Sin dolly" if dv in ("NONE","0")
                         else f"T0605-{int(dv):04d}")
                     self._set_status("EEPROM leída correctamente", GREEN)
             return
-
         if msg.startswith("READ_ERROR:"):
-            err = msg.split(":", 1)[1].replace("_", " ")
+            err = msg.split(":",1)[1].replace("_"," ")
             self.var_cur_jaula.set("Error")
             self.var_cur_dolly.set("—")
             self._set_status(f"⚠  {err}", RED)
             return
-
         if msg.startswith("OK!"):
             self._set_status(f"✅  {msg}", GREEN)
             self.after(900, self._on_leer)
             return
-
         if msg.startswith("ERROR:"):
-            self._set_status(f"❌  {msg.split(':', 1)[1]}", RED)
+            self._set_status(f"❌  {msg.split(':',1)[1]}", RED)
             return
-
         self._set_status(msg, GRAY2)
 
     # ─── Queue polling ────────────────────────────────────────────────────────
@@ -767,24 +1104,20 @@ class App(tk.Tk):
                         self.lbox.selection_set(0)
                         self.sel_dev = dt[0]
                         self._set_status(
-                            f"{len(dt)} dispositivo(s) IDJ encontrado(s) — presiona CONECTAR",
+                            f"{len(dt)} dispositivo(s) encontrado(s) — presiona CONECTAR",
                             GREEN)
                     else:
-                        self._set_status(
-                            "No se encontraron dispositivos IDJ — intenta de nuevo",
-                            YELLOW)
+                        self._set_status("No se encontraron dispositivos IDJ", YELLOW)
 
                 elif tp == "connected":
                     self.dot2.config(fg=GREEN)
                     self.var_ble_info.set(
                         f"Conectado  •  "
                         f"{self.sel_dev.name if self.sel_dev else dt}")
-                    self._set_status("Conectado — cargando datos de API y leyendo esclavo...",
-                                     GREEN)
+                    self._set_status("Conectado — cargando datos...", GREEN)
                     self.btn_prog.config(state="normal")
                     self._show("prog")
                     self._set_tab("jaula")
-                    # Cargar API automáticamente al conectar
                     if not self.api_cargada:
                         self.after(500, self._cargar_api)
 
@@ -802,22 +1135,70 @@ class App(tk.Tk):
 
                 elif tp == "api_ok":
                     self._actualizar_lista()
+                    ts = dt or ""
+                    self.var_ultima_act.set(f"Actualizado: {ts}")
+                    self.lbl_ultima_act.config(fg=GREEN)
                     total_j = len(self.jaulas_api)
                     total_d = len(self.dollies_api)
                     self._set_status(
-                        f"API cargada: {total_j} jaulas, {total_d} dollies",
+                        f"✅ API guardada: {total_j} jaulas, {total_d} dollies ({ts})",
                         GREEN)
+
+                elif tp == "api_ok_silencioso":
+                    self._actualizar_lista()
+                    ts = dt or ""
+                    self.var_ultima_act.set(f"Actualizado: {ts}")
+                    self.lbl_ultima_act.config(fg=GREEN)
 
                 elif tp == "api_error":
                     self.lbox_api.delete(0, "end")
-                    self.lbox_api.insert("end",
-                        "  ⚠  Error al consultar la API")
-                    self.lbox_api.insert("end",
-                        "  Verifica la conexión WiFi")
-                    self.lbox_api.insert("end",
-                        "  y presiona ↻ Actualizar lista")
-                    self._set_status(
-                        f"Error API: {dt} — verifica WiFi", RED)
+                    self.lbox_api.insert("end", "  ⚠  Error al consultar la API")
+                    self.lbox_api.insert("end", "  Verifica la conexión WiFi")
+                    self.lbox_api.insert("end", "  y presiona ↻ Actualizar lista")
+                    if self.jaulas_api:
+                        self._actualizar_lista()
+                        self._set_status(
+                            f"Sin internet — usando datos guardados ({self.var_ultima_act.get()})",
+                            YELLOW)
+                    else:
+                        self._set_status(f"Sin datos y sin internet: {dt}", RED)
+
+                elif tp == "wifi_scan_ok":
+                    self.redes_wifi = dt
+                    self.lbox_wifi.delete(0, "end")
+                    if dt:
+                        for red in dt:
+                            barras  = self._barras_senal(red["signal"])
+                            candado = " 🔒" if red["segura"] else ""
+                            self.lbox_wifi.insert(
+                                "end",
+                                f"  {barras}  {red['ssid']}{candado}")
+                        self.var_wifi_msg.set(
+                            f"{len(dt)} redes encontradas — toca una para seleccionar")
+                        self.lbl_wifi_msg.config(fg=GREEN)
+                    else:
+                        self.lbox_wifi.insert("end", "  No se encontraron redes")
+                        self.var_wifi_msg.set("No se encontraron redes WiFi", )
+                        self.lbl_wifi_msg.config(fg=YELLOW)
+
+                elif tp == "wifi_scan_error":
+                    self.lbox_wifi.delete(0, "end")
+                    self.lbox_wifi.insert("end", f"  Error: {dt}")
+                    self.var_wifi_msg.set(f"Error al escanear: {dt}")
+                    self.lbl_wifi_msg.config(fg=RED)
+
+                elif tp == "wifi_connect_ok":
+                    self.var_wifi_msg.set(f"✅  Conectado a {dt} exitosamente")
+                    self.lbl_wifi_msg.config(fg=GREEN)
+                    self.var_wifi_act.set(f"Conectado a: {dt}")
+                    self.pwd_chars = []
+                    self.var_pwd_disp.set("")
+                    # Intentar actualizar API ahora que hay internet
+                    self.after(1000, self._actualizar_api_silencioso)
+
+                elif tp == "wifi_connect_fail":
+                    self.var_wifi_msg.set(f"❌  Error al conectar: {dt}")
+                    self.lbl_wifi_msg.config(fg=RED)
 
                 elif tp == "status":
                     self._set_status(*dt)
