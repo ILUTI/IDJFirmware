@@ -195,7 +195,9 @@ class App(tk.Tk):
         self.var_pwd_disp = tk.StringVar(value="")
         self.var_red_sel  = tk.StringVar(value="Selecciona una red de la lista")
         self.var_wifi_msg = tk.StringVar(value="")
-        self.var_wifi_act = tk.StringVar(value="")
+        self.var_wifi_act    = tk.StringVar(value="")
+        self.wifi_encendido  = True
+        self.var_wifi_toggle = tk.StringVar(value="● WiFi  ON")
 
         # Cargar cache al arrancar
         ts = self._cargar_cache()
@@ -214,19 +216,23 @@ class App(tk.Tk):
 
     # ─── Navegación ───────────────────────────────────────────────────────────
     def _build(self):
-        self.scr_conn = tk.Frame(self, bg=BG)
-        self.scr_prog = tk.Frame(self, bg=BG)
-        self.scr_wifi = tk.Frame(self, bg=BG)
-        for s in (self.scr_conn, self.scr_prog, self.scr_wifi):
+        self.scr_conn       = tk.Frame(self, bg=BG)
+        self.scr_prog       = tk.Frame(self, bg=BG)
+        self.scr_wifi_redes = tk.Frame(self, bg=BG)
+        self.scr_wifi_pwd   = tk.Frame(self, bg=BG)
+        for s in (self.scr_conn, self.scr_prog,
+                  self.scr_wifi_redes, self.scr_wifi_pwd):
             s.place(x=0, y=0, width=W, height=H)
         self._build_conn(self.scr_conn)
         self._build_prog(self.scr_prog)
-        self._build_wifi(self.scr_wifi)
+        self._build_wifi_redes(self.scr_wifi_redes)
+        self._build_wifi_pwd(self.scr_wifi_pwd)
 
     def _show(self, name):
-        {"conn": self.scr_conn,
-         "prog": self.scr_prog,
-         "wifi": self.scr_wifi}[name].tkraise()
+        {"conn":       self.scr_conn,
+         "prog":       self.scr_prog,
+         "wifi_redes": self.scr_wifi_redes,
+         "wifi_pwd":   self.scr_wifi_pwd}[name].tkraise()
 
     # =========================================================================
     # PANTALLA 1 — CONEXIÓN BLE
@@ -504,169 +510,266 @@ class App(tk.Tk):
         self.lbox_api.insert("end", "  Cargando datos...")
 
     # =========================================================================
-    # PANTALLA 3 — CONFIGURACIÓN WIFI
+    # PANTALLA WiFi 1 — LISTA DE REDES
     # =========================================================================
-    def _build_wifi(self, p):
-        # Header
+    def _build_wifi_redes(self, p):
         hdr = tk.Frame(p, bg=PANEL, height=65)
         hdr.place(x=0, y=0, width=W, height=65)
         self._btn(hdr, "←  VOLVER", CARD, lambda: self._show("conn"),
-                  x=15, y=12, w=140, h=42, font=("Arial", 13, "bold"))
+                  x=15, y=12, w=150, h=42, font=("Arial", 13, "bold"))
         tk.Label(hdr, text="GIO  ·  CONFIGURACIÓN WIFI",
                  bg=PANEL, fg=WHITE,
-                 font=("Arial", 19, "bold")).place(x=175, y=18)
-
-        # Red activa en el header
+                 font=("Arial", 19, "bold")).place(x=180, y=18)
         self.lbl_wifi_act = tk.Label(hdr, textvariable=self.var_wifi_act,
                                      bg=PANEL, fg=GREEN, font=("Arial", 12))
-        self.lbl_wifi_act.place(x=W - 320, y=22)
+        self.lbl_wifi_act.place(x=W - 310, y=22)
 
-        # ── Panel izquierdo — lista de redes ──────────────────────────────
-        LW = 460
-        tk.Label(p, text="REDES DISPONIBLES",
-                 bg=BG, fg=GRAY2,
-                 font=("Arial", 14, "bold")).place(x=15, y=78)
+        cy = 75
+        # Toggle WiFi ON/OFF
+        self.btn_wifi_toggle = tk.Button(
+            p, textvariable=self.var_wifi_toggle,
+            bg=GREEN, fg=WHITE,
+            font=("Arial", 15, "bold"), relief="flat",
+            activebackground=WHITE, activeforeground=BG,
+            command=self._on_wifi_toggle)
+        self.btn_wifi_toggle.place(x=15, y=cy, width=240, height=60)
 
         self._btn(p, "⟳  ESCANEAR REDES", BLUE, self._on_escanear_wifi,
-                  x=15, y=100, w=430, h=58, font=("Arial", 17, "bold"))
+                  x=268, y=cy, w=280, h=60, font=("Arial", 15, "bold"))
 
-        lf_wifi = tk.Frame(p, bg=CARD)
-        lf_wifi.place(x=15, y=168, width=430, height=480)
-        sb_wifi = tk.Scrollbar(lf_wifi, orient="vertical", bg=CARD,
-                               troughcolor=CARD, activebackground=BLUE)
-        sb_wifi.pack(side="right", fill="y")
+        # Botón seleccionar — se activa al tocar una red
+        self.btn_sel_red = tk.Button(
+            p, text="SELECCIONAR ESTA RED  →",
+            bg=GRAY, fg=WHITE,
+            font=("Arial", 17, "bold"), relief="flat",
+            activebackground=WHITE, activeforeground=BG,
+            state="disabled",
+            command=self._on_ir_a_pwd)
+        self.btn_sel_red.place(x=W - 450, y=cy, width=435, height=60)
+
+        tk.Label(p, text="REDES DISPONIBLES — toca una red para seleccionarla",
+                 bg=BG, fg=GRAY2,
+                 font=("Arial", 13, "bold")).place(x=15, y=cy + 72)
+
+        lf = tk.Frame(p, bg=CARD)
+        lf.place(x=15, y=cy + 100, width=W - 30, height=430)
+        sb_w = tk.Scrollbar(lf, orient="vertical", bg=CARD,
+                            troughcolor=CARD, activebackground=BLUE)
+        sb_w.pack(side="right", fill="y")
         self.lbox_wifi = tk.Listbox(
-            lf_wifi, bg=CARD, fg=WHITE,
+            lf, bg=CARD, fg=WHITE,
             selectbackground=BLUE, selectforeground=WHITE,
-            font=("Arial", 20), borderwidth=0,
-            highlightthickness=0, activestyle="none",
-            yscrollcommand=sb_wifi.set)
-        self.lbox_wifi.pack(side="left", fill="both", expand=True, padx=6, pady=6)
-        sb_wifi.config(command=self.lbox_wifi.yview)
+            font=("Arial", 26),
+            borderwidth=0, highlightthickness=0, activestyle="none",
+            yscrollcommand=sb_w.set)
+        self.lbox_wifi.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        sb_w.config(command=self.lbox_wifi.yview)
         self.lbox_wifi.bind("<<ListboxSelect>>", self._on_red_select)
 
-        # ── Separador vertical ─────────────────────────────────────────────
-        tk.Frame(p, bg=CARD).place(x=455, y=65, width=2, height=600)
+        sb2 = tk.Frame(p, bg=PANEL, height=50)
+        sb2.place(x=0, y=H - 50, width=W, height=50)
+        self.lbl_wifi_msg = tk.Label(sb2, textvariable=self.var_wifi_msg,
+                                     bg=PANEL, fg=GREEN,
+                                     font=("Arial", 13, "bold"))
+        self.lbl_wifi_msg.place(x=20, y=12)
+        self.after(200, self._verificar_wifi_estado)
 
-        # ── Panel derecho — contraseña y teclado ──────────────────────────
-        RX = 465
+    # =========================================================================
+    # PANTALLA WiFi 2 — INGRESO DE CONTRASEÑA
+    # =========================================================================
+    def _build_wifi_pwd(self, p):
+        hdr = tk.Frame(p, bg=PANEL, height=65)
+        hdr.place(x=0, y=0, width=W, height=65)
+        self._btn(hdr, "←  REDES", CARD, lambda: self._show("wifi_redes"),
+                  x=15, y=12, w=150, h=42, font=("Arial", 13, "bold"))
+        self.lbl_pwd_hdr = tk.Label(hdr,
+                                    text="Ingresar contraseña",
+                                    bg=PANEL, fg=WHITE,
+                                    font=("Arial", 17, "bold"))
+        self.lbl_pwd_hdr.place(x=180, y=18)
 
-        # Red seleccionada
-        red_card = tk.Frame(p, bg=PANEL)
-        red_card.place(x=RX, y=68, width=810, height=68)
-        tk.Label(red_card, text="Red seleccionada:",
-                 bg=PANEL, fg=GRAY2, font=("Arial", 11)).place(x=12, y=8)
-        tk.Label(red_card, textvariable=self.var_red_sel,
-                 bg=PANEL, fg=WHITE,
-                 font=("Arial", 16, "bold")).place(x=12, y=32)
+        # Info de la red
+        info_card = tk.Frame(p, bg=PANEL)
+        info_card.place(x=0, y=65, width=W, height=58)
+        self.lbl_red_info = tk.Label(info_card,
+                                     textvariable=self.var_red_sel,
+                                     bg=PANEL, fg=WHITE,
+                                     font=("Arial", 18, "bold"))
+        self.lbl_red_info.place(x=20, y=12)
 
         # Campo contraseña
         tk.Label(p, text="Contraseña:",
-                 bg=BG, fg=GRAY2, font=("Arial", 12)).place(x=RX+8, y=146)
-
-        pwd_frame = tk.Frame(p, bg=BLUE, padx=2, pady=2)
-        pwd_frame.place(x=RX+8, y=168, width=700, height=58)
+                 bg=BG, fg=GRAY2, font=("Arial", 13)).place(x=20, y=132)
+        pwd_frame = tk.Frame(p, bg=BLUE, padx=3, pady=3)
+        pwd_frame.place(x=20, y=155, width=W - 100, height=65)
         self.lbl_pwd = tk.Label(pwd_frame,
                                 textvariable=self.var_pwd_disp,
                                 bg=CARD, fg=WHITE,
-                                font=("Arial", 24, "bold"),
-                                anchor="w", padx=12)
+                                font=("Arial", 28, "bold"),
+                                anchor="w", padx=14)
         self.lbl_pwd.pack(fill="both", expand=True)
-
-        # Botón mostrar/ocultar
         self.btn_eye = self._btn(p, "👁", CARD, self._on_toggle_pwd,
-                                 x=RX+718, y=168, w=58, h=58,
-                                 font=("Arial", 16))
+                                 x=W - 72, y=155, w=62, h=65,
+                                 font=("Arial", 18))
 
-        # ── Teclado QWERTY ────────────────────────────────────────────────
-        self._build_teclado_wifi(p, x=RX+8, y=238)
+        # Teclado grande
+        self._build_teclado_grande(p, y=232)
 
-        # Botones conectar / limpiar
+        # Botones
         self.btn_conectar_wifi = self._btn(
             p, "✓  CONECTAR A RED", GREEN, self._on_conectar_wifi,
-            x=RX+8, y=620, w=480, h=55, font=("Arial", 15, "bold"))
-        self._btn(p, "✕ Borrar contraseña", CARD, self._on_borrar_pwd,
-                  x=RX+500, y=620, w=278, h=55, font=("Arial", 13, "bold"))
+            x=20, y=H - 108, w=580, h=65,
+            font=("Arial", 18, "bold"))
+        self._btn(p, "✕  BORRAR CONTRASEÑA", CARD, self._on_borrar_pwd,
+                  x=618, y=H - 108, w=310, h=65,
+                  font=("Arial", 14, "bold"))
 
-        # Status bar
-        sb = tk.Frame(p, bg=PANEL, height=45)
-        sb.place(x=0, y=H - 45, width=W, height=45)
-        self.lbl_wifi_msg = tk.Label(sb, textvariable=self.var_wifi_msg,
-                                     bg=PANEL, fg=GREEN,
-                                     font=("Arial", 13, "bold"))
-        self.lbl_wifi_msg.place(x=20, y=10)
+        sb = tk.Frame(p, bg=PANEL, height=43)
+        sb.place(x=0, y=H - 43, width=W, height=43)
+        self.lbl_pwd_msg = tk.Label(sb, textvariable=self.var_wifi_msg,
+                                    bg=PANEL, fg=GREEN,
+                                    font=("Arial", 13, "bold"))
+        self.lbl_pwd_msg.place(x=20, y=10)
 
-    def _build_teclado_wifi(self, p, x, y):
-        """Teclado QWERTY táctil para ingreso de contraseña WiFi."""
-        KW, KH, KG = 70, 52, 5  # ancho, alto, gap por tecla
+    def _build_teclado_grande(self, p, y):
+        """Teclado QWERTY a pantalla completa para contraseña WiFi."""
+        MARGIN = 15
+        AVAIL  = W - 2 * MARGIN
+        KH     = 55
+        KG     = 6
 
-        filas = [
+        filas_letras = [
             ['1','2','3','4','5','6','7','8','9','0','-','_'],
             ['q','w','e','r','t','y','u','i','o','p'],
             ['a','s','d','f','g','h','j','k','l'],
             ['z','x','c','v','b','n','m','.','@','#'],
         ]
 
-        for r, fila in enumerate(filas):
-            row_w = len(fila) * (KW + KG) - KG
-            ox = x + (800 - row_w) // 2
+        for r, fila in enumerate(filas_letras):
+            n   = len(fila)
+            kw  = (AVAIL - (n - 1) * KG) // n
+            ox  = MARGIN + (AVAIL - (n * kw + (n - 1) * KG)) // 2
+            ry  = y + r * (KH + KG)
             for c, ch in enumerate(fila):
-                bx = ox + c * (KW + KG)
-                by = y + r * (KH + KG)
-                tk.Button(p, text=ch.upper() if self.caps_on else ch,
+                bx = ox + c * (kw + KG)
+                lbl = ch.upper() if self.caps_on else ch
+                tk.Button(p, text=lbl,
                           bg=CARD, fg=WHITE,
-                          font=("Arial", 14, "bold"), relief="flat",
+                          font=("Arial", 17, "bold"), relief="flat",
                           activebackground=BLUE, activeforeground=WHITE,
                           command=lambda k=ch: self._on_tecla(k)
-                          ).place(x=bx, y=by, width=KW, height=KH)
+                          ).place(x=bx, y=ry, width=kw, height=KH)
 
         # Fila especial
-        ey = y + 4 * (KH + KG)
+        ry_esp  = y + 4 * (KH + KG)
+        w_caps  = 170
+        w_excl  = 85
+        w_pct   = 85
+        w_back  = 120
+        w_gaps  = 4 * KG
+        w_space = AVAIL - w_caps - w_excl - w_pct - w_back - w_gaps
+
         especiales = [
-            ("⇧ CAPS", 120, TEAL,   self._on_caps),
-            ("ESPACIO", 280, CARD,   lambda: self._on_tecla(' ')),
-            ("!",       70,  CARD,   lambda: self._on_tecla('!')),
-            ("%",       70,  CARD,   lambda: self._on_tecla('%')),
-            ("←",      80,  YELLOW, self._on_backspace_wifi),
+            ("⇧ CAPS", w_caps,  TEAL,   self._on_caps),
+            ("ESPACIO", w_space, CARD,   lambda: self._on_tecla(' ')),
+            ("!",       w_excl,  CARD,   lambda: self._on_tecla('!')),
+            ("%",       w_pct,   CARD,   lambda: self._on_tecla('%')),
+            ("←",       w_back,  YELLOW, self._on_backspace_wifi),
         ]
-        ex = x + 10
+        ex = MARGIN
         for (txt, w, color, cmd) in especiales:
             tk.Button(p, text=txt, bg=color, fg=WHITE,
-                      font=("Arial", 13, "bold"), relief="flat",
+                      font=("Arial", 14, "bold"), relief="flat",
                       activebackground=BLUE, activeforeground=WHITE,
-                      command=cmd).place(x=ex, y=ey, width=w, height=KH)
+                      command=cmd).place(x=ex, y=ry_esp, width=w, height=KH)
             ex += w + KG
 
-        # Guardar referencias para actualizar mayúsculas
         self._teclado_parent = p
-        self._teclado_x      = x
         self._teclado_y      = y
-        self._teclado_kw     = KW
         self._teclado_kh     = KH
         self._teclado_kg     = KG
-        self._teclado_filas  = filas
+        self._teclado_filas  = filas_letras
+        self._teclado_avail  = AVAIL
+        self._teclado_margin = MARGIN
 
     def _actualizar_teclado_caps(self):
-        """Actualiza el texto de las teclas cuando cambia CAPS."""
-        KW = self._teclado_kw; KH = self._teclado_kh; KG = self._teclado_kg
-        p = self._teclado_parent
-        x = self._teclado_x;   y = self._teclado_y
-
+        AVAIL  = self._teclado_avail
+        MARGIN = self._teclado_margin
+        KH     = self._teclado_kh
+        KG     = self._teclado_kg
+        p      = self._teclado_parent
+        y      = self._teclado_y
         for r, fila in enumerate(self._teclado_filas):
-            row_w = len(fila) * (KW + KG) - KG
-            ox = x + (800 - row_w) // 2
+            n  = len(fila)
+            kw = (AVAIL - (n - 1) * KG) // n
+            ox = MARGIN + (AVAIL - (n * kw + (n - 1) * KG)) // 2
+            ry = y + r * (KH + KG)
             for c, ch in enumerate(fila):
-                bx = ox + c * (KW + KG)
-                by = y + r * (KH + KG)
-                # Buscar el widget en esa posición y actualizar texto
-                for w in p.place_slaves():
-                    info = w.place_info()
+                bx = ox + c * (kw + KG)
+                for widget in p.place_slaves():
+                    info = widget.place_info()
                     if (int(info.get('x', -1)) == bx and
-                            int(info.get('y', -1)) == by):
-                        w.config(text=ch.upper() if self.caps_on else ch)
+                            int(info.get('y', -1)) == ry):
+                        widget.config(text=ch.upper() if self.caps_on else ch)
                         break
 
-    # ─── Helper botón ─────────────────────────────────────────────────────────
+    # ─── WiFi: métodos nuevos ──────────────────────────────────────────────────
+    def _verificar_wifi_estado(self):
+        try:
+            result = subprocess.run(
+                ['nmcli', 'radio', 'wifi'],
+                capture_output=True, text=True, timeout=5)
+            self.wifi_encendido = 'enabled' in result.stdout.lower()
+        except Exception:
+            self.wifi_encendido = True
+        self._actualizar_btn_wifi()
+
+    def _actualizar_btn_wifi(self):
+        if self.wifi_encendido:
+            self.var_wifi_toggle.set("● WiFi  ON")
+            self.btn_wifi_toggle.config(bg=GREEN)
+        else:
+            self.var_wifi_toggle.set("○ WiFi  OFF")
+            self.btn_wifi_toggle.config(bg=GRAY)
+
+    def _on_wifi_toggle(self):
+        try:
+            nuevo = 'off' if self.wifi_encendido else 'on'
+            subprocess.run(['nmcli', 'radio', 'wifi', nuevo], timeout=8)
+            self.wifi_encendido = not self.wifi_encendido
+            self._actualizar_btn_wifi()
+            if self.wifi_encendido:
+                self.var_wifi_msg.set("WiFi encendido — escaneando redes...")
+                self.lbl_wifi_msg.config(fg=GREEN)
+                self.after(1200, self._on_escanear_wifi)
+            else:
+                self.var_wifi_msg.set("WiFi apagado")
+                self.lbl_wifi_msg.config(fg=GRAY)
+                self.lbox_wifi.delete(0, "end")
+        except Exception as e:
+            self.var_wifi_msg.set(f"Error: {e}")
+            self.lbl_wifi_msg.config(fg=RED)
+
+    def _on_ir_a_pwd(self):
+        if not self.sel_red: return
+        ssid   = self.sel_red["ssid"]
+        segura = self.sel_red["segura"]
+        barras = self._barras_senal(self.sel_red.get("signal", "0"))
+        candado = "🔒 Red segura" if segura else "🔓 Red abierta"
+        self.lbl_pwd_hdr.config(text=f"Contraseña para:  {ssid}")
+        self.var_red_sel.set(f"  {barras}   {ssid}   —   {candado}")
+        self.pwd_chars   = []
+        self.pwd_visible = False
+        self.var_pwd_disp.set("")
+        if not segura:
+            self.var_wifi_msg.set("Red abierta — presiona CONECTAR directamente")
+            self.lbl_wifi_msg.config(fg=YELLOW)
+        else:
+            self.var_wifi_msg.set(f"Ingresa la contraseña de  {ssid}")
+            self.lbl_wifi_msg.config(fg=GRAY2)
+        self._show("wifi_pwd")
+
+        # ─── Helper botón ─────────────────────────────────────────────────────────
     def _btn(self, parent, text, color, cmd, x, y, w, h, font=None):
         if font is None: font = ("Arial", 13, "bold")
         b = tk.Button(parent, text=text, bg=color, fg=WHITE, font=font,
@@ -896,6 +999,8 @@ class App(tk.Tk):
         self.var_red_sel.set(f"{ssid}  {'🔒' if segura else '🔓 Red abierta'}")
         self.pwd_chars = []
         self.var_pwd_disp.set("")
+        # Activar el botón de seleccionar red
+        self.btn_sel_red.config(state="normal", bg=GREEN)
         if not segura:
             self.var_wifi_msg.set("Red abierta — presiona CONECTAR sin contraseña")
             self.lbl_wifi_msg.config(fg=YELLOW)
@@ -1029,7 +1134,7 @@ class App(tk.Tk):
         red_actual = self._get_wifi_actual()
         self.var_wifi_act.set(
             f"Conectado a: {red_actual}" if red_actual else "Sin conexión WiFi")
-        self._show("wifi")
+        self._show("wifi_redes")
         # Auto-escanear al abrir
         self.after(300, self._on_escanear_wifi)
 
