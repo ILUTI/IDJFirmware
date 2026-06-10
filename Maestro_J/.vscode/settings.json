@@ -1,0 +1,12 @@
+{
+    "idf.flashType": "UART",
+    "idf.portWin": "COM33",
+    "idf.currentSetup": "C:\\Users\\slopez\\esp\\v5.5\\esp-idf",
+    "idf.monitorPort": "COM33",
+    "idf.openOcdConfigs": [
+        "board/esp32c3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32c3"
+    }
+}
