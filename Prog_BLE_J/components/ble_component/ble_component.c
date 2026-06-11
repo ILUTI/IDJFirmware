@@ -7,7 +7,6 @@
 extern QueueHandle_t cola_programacion_jaula;
 
 // ── Variables compartidas con main_programador.c ──────────────────────────────
-volatile uint16_t ble_pending_dolly = 0;   // Dolly pendiente de programar
 volatile bool     ble_cmd_leer      = false; // Flag: ejecutar lectura de EEPROM
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -30,9 +29,7 @@ static const uint16_t GATTS_CHAR_UUID_ID        = 0xFF0A;
 static const uint16_t GATTS_CHAR_UUID_WIFI_SSID = 0xA0B2;
 static const uint16_t GATTS_CHAR_UUID_WIFI_PSWD = 0xA0B3;
 static const uint16_t GATTS_CHAR_UUID_JAULA      = 0xA0B4;
-static const uint16_t GATTS_CHAR_UUID_DOLLY      = 0xA0B6;  // NUEVO
 static const uint16_t GATTS_CHAR_UUID_STATUS     = 0xA0B5;
-
 // ── Propiedades de características ───────────────────────────────────────────
 static const uint16_t primary_service_uuid         = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid   = ESP_GATT_UUID_CHAR_DECLARE;
@@ -151,15 +148,7 @@ static const esp_gatts_attr_db_t gatt_db[DEVICE_IDX_NB] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_JAULA, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
       GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
 
-    // Número de Dolly 0xA0B6 — NUEVO (Write = guarda pendiente, "0" o "NONE" = sin dolly)
-    [DEVICE_CHAR_DOLLY] =
-    {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
-      CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_write}},
-    [DEVICE_CHAR_VAL_DOLLY] =
-    {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_DOLLY, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
-      GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
-
-    // Canal de respuesta 0xA0B5 (Read + Notify)
+// Canal de respuesta 0xA0B5 (Read + Notify)
     [DEVICE_CHAR_STATUS] =
     {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
       CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_notify}},
@@ -213,18 +202,6 @@ static void handle_read_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *
                                     param->read.trans_id, ESP_GATT_OK, &rsp);
         break;
 
-    case DEVICE_CHAR_VAL_DOLLY: {
-        // Devuelve el dolly pendiente como texto (ej. "45" o "0")
-        char dolly_str[8];
-        snprintf(dolly_str, sizeof(dolly_str), "%d", (int)ble_pending_dolly);
-        rsp.attr_value.handle = param->read.handle;
-        rsp.attr_value.len    = strlen(dolly_str);
-        memcpy(rsp.attr_value.value, dolly_str, rsp.attr_value.len);
-        esp_ble_gatts_send_response(gatts_if, param->read.conn_id,
-                                    param->read.trans_id, ESP_GATT_OK, &rsp);
-        break;
-    }
-
     default:
         rsp.attr_value.handle  = param->read.handle;
         rsp.attr_value.len     = 1;
@@ -274,31 +251,12 @@ static void handle_write_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t 
         } else {
             uint16_t num_jaula = (uint16_t)atoi(value);
             if (num_jaula >= 1 && num_jaula <= 9999) {
-                ESP_LOGI(BLE_TAG, "WRITE: Jaula → #%d (dolly pendiente: #%d)",
-                         num_jaula, (int)ble_pending_dolly);
+                ESP_LOGI(BLE_TAG, "WRITE: Jaula → #%d", num_jaula);
                 if (cola_programacion_jaula != NULL) {
                     xQueueSend(cola_programacion_jaula, &num_jaula, 0);
                 }
             } else {
                 ESP_LOGE(BLE_TAG, "Número de jaula inválido: '%s' (rango 1-9999)", value);
-            }
-        }
-        break;
-
-    // ── Número de Dolly (0xA0B6) ─────────────────────────────────────────────
-    // Escribir un número (1-9999) → guarda como dolly pendiente.
-    // Escribir "0" o "NONE"      → sin dolly (borra el pendiente).
-    case DEVICE_CHAR_VAL_DOLLY:
-        if (strcmp(value, "NONE") == 0 || strcmp(value, "0") == 0) {
-            ble_pending_dolly = 0;
-            ESP_LOGI(BLE_TAG, "WRITE: Dolly → sin dolly");
-        } else {
-            uint16_t num_dolly = (uint16_t)atoi(value);
-            if (num_dolly >= 1 && num_dolly <= 9999) {
-                ble_pending_dolly = num_dolly;
-                ESP_LOGI(BLE_TAG, "WRITE: Dolly pendiente → #%d", num_dolly);
-            } else {
-                ESP_LOGE(BLE_TAG, "Número de dolly inválido: '%s' (rango 1-9999)", value);
             }
         }
         break;
@@ -409,7 +367,6 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
     case ESP_GATTS_DISCONNECT_EVT:
         ESP_LOGI(BLE_TAG, "DISCONNECT reason=0x%x", param->disconnect.reason);
         ble_is_connected  = false;
-        ble_pending_dolly = 0;   // Limpiar dolly pendiente al desconectar
         ble_cmd_leer      = false;
         esp_ble_gap_start_advertising(&adv_params);
         break;
