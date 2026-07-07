@@ -429,7 +429,7 @@ class App(tk.Tk):
             lf, bg=CARD, fg=WHITE,
             selectbackground=BLUE, selectforeground=WHITE,
             # ─── TAMAÑO DE LETRA — cambiar: 22=mediano  28=grande  34=muy grande
-            font=("Arial", 28),
+            font=("Arial", 41),
             borderwidth=0, highlightthickness=0, activestyle="none",
             yscrollcommand=sb_list.set)
         self.lbox_api.pack(side="left", fill="both", expand=True, padx=4, pady=4)

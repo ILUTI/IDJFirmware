@@ -1,4 +1,4 @@
-// IDJ Maestro v2 — Solo Jaulas
+// IDJ Maestro v2 — Solo Jaulas (fix reconexión)
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -9,11 +9,9 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
-
 #include "nvs_component.h"
 #include "mqtt_component.h"
 #include "wifi_component.h"
-
 #include "driver/i2c.h"
 #include "ds2482.h"
 #include "ds2431.h"
@@ -21,23 +19,25 @@
 #include "esp_task_wdt.h"
 
 #define TAG "IDJ"
-
 #define I2C_MASTER_SCL_IO    5
 #define I2C_MASTER_SDA_IO    4
 #define I2C_MASTER_NUM       I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ   100000
-
 #define MAX_DEVICES          20
-#define AUSENCIAS_EVICTAR    5
 #define SCAN_INTERVAL_MS     3000
 #define BUS_ERRORES_MAX      5
-#define CICLOS_EEPROM        10    // 10 × 3s = 30s entre re-lecturas
+#define CICLOS_EEPROM        10
 
-// ── Estructura de dispositivo — solo jaula ────────────────────────────────────
+// FIX Bug 1: umbral más alto — 30 ciclos × 3s = 90s antes de evictar
+#define AUSENCIAS_PRESENTE              3
+#define AUSENCIAS_EVICTAR              30
+// FIX Bug 1b: cuando el bus está vacío, incrementar ausencias más lento
+#define BUS_VACIO_CICLOS_INCREMENTO     3
+
 typedef struct {
     uint64_t rom;
     char     rom_str[17];
-    char     unidad[12];    // "T0603-xxxx"
+    char     unidad[12];
     bool     asignado;
     uint8_t  ausencias;
     bool     presente;
@@ -46,8 +46,8 @@ typedef struct {
 static dispositivo_t dispositivos[MAX_DEVICES];
 static size_t num_dispositivos = 0;
 static bool nvs_dirty = false;
+static uint32_t ciclos_bus_vacio = 0;
 
-// ── Utilidades ROM ────────────────────────────────────────────────────────────
 void rom_to_string(uint64_t rom, char *output) {
     uint8_t *bytes = (uint8_t *)&rom;
     for (int i = 0; i < 8; i++) sprintf(output + (i * 2), "%02X", bytes[i]);
@@ -65,11 +65,9 @@ bool rom_es_ds2431(uint64_t rom) {
     return ((uint8_t)(rom & 0xFF) == 0x2D);
 }
 
-// ── NVS ───────────────────────────────────────────────────────────────────────
 void guardar_en_nvs() {
     nvs_handle_t handle;
     if (nvs_open("storage", NVS_READWRITE, &handle) != ESP_OK) return;
-
     cJSON *root  = cJSON_CreateObject();
     cJSON *array = cJSON_AddArrayToObject(root, "devices");
     for (size_t i = 0; i < num_dispositivos; i++) {
@@ -92,15 +90,11 @@ void guardar_en_nvs() {
 void cargar_desde_nvs() {
     nvs_handle_t handle;
     if (nvs_open("storage", NVS_READWRITE, &handle) != ESP_OK) return;
-
     size_t required_size = 0;
     if (nvs_get_str(handle, "devices", NULL, &required_size) != ESP_OK
-        || required_size == 0) {
-        nvs_close(handle); return;
-    }
+        || required_size == 0) { nvs_close(handle); return; }
     char *json_str = malloc(required_size);
     if (!json_str) { nvs_close(handle); return; }
-
     nvs_get_str(handle, "devices", json_str, &required_size);
     cJSON *root = cJSON_Parse(json_str);
     if (root) {
@@ -117,10 +111,10 @@ void cargar_desde_nvs() {
             dispositivos[idx].rom = string_to_rom(r->valuestring);
             rom_to_string(dispositivos[idx].rom, dispositivos[idx].rom_str);
             strncpy(dispositivos[idx].unidad, u->valuestring, 11);
-            dispositivos[idx].unidad[11]  = '\0';
-            dispositivos[idx].asignado    = (bool)a->valueint;
-            dispositivos[idx].presente    = false;
-            dispositivos[idx].ausencias   = 0;
+            dispositivos[idx].unidad[11] = '\0';
+            dispositivos[idx].asignado   = (bool)a->valueint;
+            dispositivos[idx].presente   = false;
+            dispositivos[idx].ausencias  = 0;
             num_dispositivos++;
         }
         cJSON_Delete(root);
@@ -129,7 +123,6 @@ void cargar_desde_nvs() {
     nvs_close(handle);
 }
 
-// ── Registro de dispositivos ──────────────────────────────────────────────────
 bool existe_dispositivo(const char *rom_str) {
     for (size_t i = 0; i < num_dispositivos; i++)
         if (strcmp(dispositivos[i].rom_str, rom_str) == 0) return true;
@@ -149,38 +142,45 @@ void agregar_dispositivo(uint64_t rom) {
     num_dispositivos++;
 }
 
-// ── Leer EEPROM de un dispositivo ─────────────────────────────────────────────
+// FIX Bug 3: lectura con hasta 3 reintentos y pausa entre ellos
 bool leer_eeprom_dispositivo(ds2482_t *ds2482, size_t idx) {
-    ds2431_t esclavo = { .rom_code = dispositivos[idx].rom };
-    ds2431_data_t datos;
-    esp_err_t err = ds2431_leer_datos(ds2482, &esclavo, &datos);
-    if (err == ESP_OK && datos.valido) {
-        strncpy(dispositivos[idx].unidad, datos.unidad, 11);
-        dispositivos[idx].unidad[11] = '\0';
-        dispositivos[idx].asignado   = true;
-        nvs_dirty = true;
-        ESP_LOGI(TAG, "EEPROM leída: %s → %s",
-                 dispositivos[idx].rom_str, dispositivos[idx].unidad);
-        return true;
-    } else if (err == ESP_ERR_INVALID_CRC) {
-        ESP_LOGW(TAG, "Esclavo %s con EEPROM corrupta",
-                 dispositivos[idx].rom_str);
-    } else {
-        ESP_LOGW(TAG, "Esclavo %s sin asignar", dispositivos[idx].rom_str);
+    for (int intento = 0; intento < 3; intento++) {
+        if (intento > 0) {
+            ESP_LOGW(TAG, "Reintento EEPROM %d/3 — %s",
+                     intento + 1, dispositivos[idx].rom_str);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        ds2431_t esclavo = { .rom_code = dispositivos[idx].rom };
+        ds2431_data_t datos;
+        esp_err_t err = ds2431_leer_datos(ds2482, &esclavo, &datos);
+        if (err == ESP_OK && datos.valido) {
+            strncpy(dispositivos[idx].unidad, datos.unidad, 11);
+            dispositivos[idx].unidad[11] = '\0';
+            dispositivos[idx].asignado   = true;
+            nvs_dirty = true;
+            ESP_LOGI(TAG, "EEPROM OK (intento %d): %s → %s",
+                     intento + 1, dispositivos[idx].rom_str,
+                     dispositivos[idx].unidad);
+            return true;
+        }
+        if (err == ESP_ERR_INVALID_CRC) {
+            ESP_LOGW(TAG, "EEPROM corrupta: %s", dispositivos[idx].rom_str);
+            return false;  // corrupción real, no reintentar
+        }
     }
+    ESP_LOGW(TAG, "EEPROM sin datos tras 3 intentos: %s",
+             dispositivos[idx].rom_str);
     return false;
 }
 
-// ── Escaneo del bus 1-Wire ────────────────────────────────────────────────────
 void escanear_dispositivos(ds2482_t *ds2482, bool leer_eeprom) {
     uint64_t roms[MAX_DEVICES];
     size_t found = 0;
-
     if (ds2482_search_rom_all(roms, MAX_DEVICES, &found) != ESP_OK) return;
     ESP_LOGI(TAG, "ROMs en bus: %d | Leer EEPROM: %s",
              found, leer_eeprom ? "SI" : "no");
 
-    // Fase 1: agregar ROMs nuevos
+    // Fase 1: agregar nuevos
     for (size_t i = 0; i < found; i++) {
         if (!rom_es_ds2431(roms[i])) continue;
         char rom_str[17]; rom_to_string(roms[i], rom_str);
@@ -190,7 +190,7 @@ void escanear_dispositivos(ds2482_t *ds2482, bool leer_eeprom) {
         }
     }
 
-    // Fase 2: actualizar presencia y (si aplica) leer EEPROM
+    // Fase 2: presencia y EEPROM
     for (size_t j = 0; j < num_dispositivos; j++) {
         bool encontrado = false;
         for (size_t i = 0; i < found; i++) {
@@ -200,8 +200,12 @@ void escanear_dispositivos(ds2482_t *ds2482, bool leer_eeprom) {
             }
         }
         if (encontrado) {
-            if (dispositivos[j].ausencias > 0)
-                ESP_LOGI(TAG, "Jaula reconectada: %s", dispositivos[j].unidad);
+            // FIX Bug 2: log de reconexión y reset de ausencias ANTES de leer
+            if (!dispositivos[j].presente)
+                ESP_LOGI(TAG, "Reconectado: %s (%s)",
+                         dispositivos[j].rom_str,
+                         dispositivos[j].asignado
+                             ? dispositivos[j].unidad : "SIN_ASIGNAR");
             dispositivos[j].presente  = true;
             dispositivos[j].ausencias = 0;
             if (leer_eeprom || !dispositivos[j].asignado) {
@@ -210,16 +214,20 @@ void escanear_dispositivos(ds2482_t *ds2482, bool leer_eeprom) {
             }
         } else {
             if (dispositivos[j].ausencias < 250) dispositivos[j].ausencias++;
-            if (dispositivos[j].ausencias >= 3)  dispositivos[j].presente = false;
+            if (dispositivos[j].ausencias >= AUSENCIAS_PRESENTE)
+                dispositivos[j].presente = false;
         }
     }
 
-    // Fase 3: evictar ausentes prolongados
+    // Fase 3: evictar — FIX Bug 1: umbral de 30 ciclos
     size_t j = 0;
     while (j < num_dispositivos) {
         if (dispositivos[j].ausencias >= AUSENCIAS_EVICTAR) {
-            ESP_LOGW(TAG, "Evictando: %s",
-                     dispositivos[j].unidad[0] ? dispositivos[j].unidad : "SIN_ASIGNAR");
+            ESP_LOGW(TAG, "Evictando tras %d ciclos: %s (%s)",
+                     AUSENCIAS_EVICTAR,
+                     dispositivos[j].unidad[0]
+                         ? dispositivos[j].unidad : "SIN_ASIGNAR",
+                     dispositivos[j].rom_str);
             memmove(&dispositivos[j], &dispositivos[j + 1],
                     (num_dispositivos - j - 1) * sizeof(dispositivo_t));
             num_dispositivos--;
@@ -228,21 +236,19 @@ void escanear_dispositivos(ds2482_t *ds2482, bool leer_eeprom) {
     }
 }
 
-// ── Publicar MQTT ─────────────────────────────────────────────────────────────
 void publicar_mqtt() {
     cJSON *json = cJSON_CreateObject();
     if (!json) return;
     cJSON *array = cJSON_AddArrayToObject(json, "jaulas");
-
     for (size_t i = 0; i < num_dispositivos; i++) {
         if (!dispositivos[i].presente) continue;
         cJSON *obj = cJSON_CreateObject();
         cJSON_AddStringToObject(obj, "rom",    dispositivos[i].rom_str);
         cJSON_AddStringToObject(obj, "unidad",
-            dispositivos[i].asignado ? dispositivos[i].unidad : "SIN_ASIGNAR");
+            dispositivos[i].asignado
+                ? dispositivos[i].unidad : "SIN_ASIGNAR");
         cJSON_AddItemToArray(array, obj);
     }
-
     char *json_str = cJSON_PrintUnformatted(json);
     int msg_id = esp_mqtt_client_publish(mqtt_client, "GIO/IDJ",
                                           json_str, 0, 0, 0);
@@ -252,7 +258,6 @@ void publicar_mqtt() {
     cJSON_Delete(json);
 }
 
-// ── App main ──────────────────────────────────────────────────────────────────
 void app_main(void) {
     init_nvs_component();
     cargar_desde_nvs();
@@ -280,7 +285,6 @@ void app_main(void) {
         ESP_ERROR_CHECK(esp_task_wdt_init(&wdt_cfg));
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
-    // Estabilización + descubrimiento inicial
     ESP_LOGI(TAG, "Estabilizando bus...");
     vTaskDelay(pdMS_TO_TICKS(2000));
     bool presence_boot = false;
@@ -309,12 +313,19 @@ void app_main(void) {
         errores_bus = 0;
 
         if (!presence) {
-            ESP_LOGW(TAG, "Bus vacío");
-            for (size_t i = 0; i < num_dispositivos; i++) {
-                if (dispositivos[i].ausencias < 250) dispositivos[i].ausencias++;
-                if (dispositivos[i].ausencias >= 3)  dispositivos[i].presente = false;
+            // FIX Bug 1b: incrementar ausencias más lento cuando bus vacío
+            ciclos_bus_vacio++;
+            if (ciclos_bus_vacio % BUS_VACIO_CICLOS_INCREMENTO == 0) {
+                for (size_t i = 0; i < num_dispositivos; i++) {
+                    if (dispositivos[i].ausencias < 250)
+                        dispositivos[i].ausencias++;
+                    if (dispositivos[i].ausencias >= AUSENCIAS_PRESENTE)
+                        dispositivos[i].presente = false;
+                }
+                ESP_LOGW(TAG, "Bus vacío — ciclo %lu", ciclo);
             }
         } else {
+            ciclos_bus_vacio = 0;
             bool es_ciclo_eeprom = (ciclo % CICLOS_EEPROM == 0);
             if (es_ciclo_eeprom)
                 ESP_LOGI(TAG, "=== ESCANEO COMPLETO (ciclo %lu) ===", ciclo);
@@ -323,7 +334,6 @@ void app_main(void) {
 
         if (nvs_dirty) { guardar_en_nvs(); nvs_dirty = false; }
 
-        // Display consola
         ESP_LOGI(TAG, "============================================");
         ESP_LOGI(TAG, "   JAULAS ENGANCHADAS | ciclo=%lu", ciclo);
         int enganchadas = 0;
