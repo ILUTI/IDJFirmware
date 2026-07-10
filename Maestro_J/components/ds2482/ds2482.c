@@ -28,8 +28,8 @@ static uint8_t g_i2c_addr;
 esp_err_t ds2482_init(ds2482_t *dev, i2c_port_t i2c_num, uint8_t address) {
     dev->i2c_num = i2c_num;
     dev->address = address;
-    g_i2c_num = i2c_num;    // <<-- agregar
-    g_i2c_addr = address;   // <<-- agregar
+    g_i2c_num = i2c_num;
+    g_i2c_addr = address;
     return ds2482_reset(dev);
 }
 
@@ -45,6 +45,24 @@ esp_err_t ds2482_set_read_pointer(uint8_t reg) {
 
 esp_err_t ds2482_read_register(uint8_t *value) {
     return i2c_master_read_from_device(g_i2c_num, g_i2c_addr, value, 1, pdMS_TO_TICKS(100));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRC-8 Dallas/Maxim (poly X^8+X^5+X^4+1, forma LSB-first 0x8C)
+// Se calcula sobre los bytes 0..6; el byte 7 de la ROM ES el CRC esperado.
+// ─────────────────────────────────────────────────────────────────────────────
+uint8_t ds2482_rom_crc8(const uint8_t *rom8) {
+    uint8_t crc = 0;
+    for (int i = 0; i < 7; i++) {
+        uint8_t inbyte = rom8[i];
+        for (int b = 0; b < 8; b++) {
+            uint8_t mix = (crc ^ inbyte) & 0x01;
+            crc >>= 1;
+            if (mix) crc ^= 0x8C;
+            inbyte >>= 1;
+        }
+    }
+    return crc;
 }
 
 // Espera a que el DS2482 libere el bus 1-Wire.
@@ -76,9 +94,13 @@ esp_err_t ds2482_1wire_reset(bool *presence) {
     err = ds2482_busy_wait();
     if (err != ESP_OK) return err;
 
-    uint8_t status;
-    ds2482_set_read_pointer(DS2482_REG_STATUS);
-    ds2482_read_register(&status);
+    // FIX: status inicializado y retornos I2C verificados. Antes, un NAK dejaba
+    // *presence con basura de stack → escaneos fantasma o ausencias falsas.
+    uint8_t status = 0;
+    err = ds2482_set_read_pointer(DS2482_REG_STATUS);
+    if (err != ESP_OK) return err;
+    err = ds2482_read_register(&status);
+    if (err != ESP_OK) return err;
 
     *presence = (status & DS2482_STATUS_PPD) != 0;
     // Pausa post-reset: 8ms para 80m de cable (~4-8nF de capacitancia).
@@ -167,6 +189,17 @@ esp_err_t ds2482_read_status(ds2482_t *dev, uint8_t *status) {
     return ds2482_read_register(status);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Búsqueda completa de ROMs con validación CRC-8 y señalización de truncamiento
+//
+//   Retorna:
+//     ESP_OK              → censo COMPLETO y confiable (usar roms[]/found)
+//     ESP_ERR_NOT_FOUND   → bus vacío (sin presencia)
+//     ESP_ERR_INVALID_STATE → escaneo TRUNCADO por ruido (censo NO confiable;
+//                             el llamador debe conservar el estado previo y
+//                             NO penalizar ausencias este ciclo)
+//     otro esp_err_t      → fallo de I2C irrecuperable
+// ─────────────────────────────────────────────────────────────────────────────
 esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *found) {
     *found = 0;
     uint64_t last_rom = 0;
@@ -180,7 +213,8 @@ esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *foun
         int bit_number = 1;
         bool conflict = false;
 
-        // Hasta 3 intentos por iteración — bus largo puede necesitar recuperación
+        // Hasta 3 intentos por dispositivo — bus largo/ruidoso puede necesitar
+        // recuperación. Un CRC-8 malo también dispara un reintento aquí.
         for (int retry = 0; retry < 3; retry++) {
             rom = 0;
             current_discrepancy = 0;
@@ -247,11 +281,33 @@ esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *foun
                 rom |= ((uint64_t)byte_val << (byte_idx * 8));
             }
 
-            if (!conflict) break; // búsqueda exitosa: salir del loop de retries
+            // Validación CRC-8 de la ROM completa. Con 1k y ruido de campo un
+            // bit corrupto durante los triplets es realista; sin este chequeo
+            // una ROM basura entraría a last_rom y descarrilaría el resto del
+            // recorrido del árbol (fantasmas + esclavos perdidos/duplicados).
+            if (!conflict) {
+                uint8_t rb[8];
+                for (int i = 0; i < 8; i++) rb[i] = (uint8_t)((rom >> (i * 8)) & 0xFF);
+                if (ds2482_rom_crc8(rb) != rb[7]) {
+                    ESP_LOGW(TAG, "CRC-8 ROM inválido (0x%016llX) — reintento %d/3",
+                             (unsigned long long)rom, retry + 1);
+                    bool dummy;
+                    ds2482_1wire_reset(&dummy);
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    conflict = true;   // reusa la ruta de reintento
+                    // NO se actualiza last_rom/last_discrepancy con una ROM mala
+                }
+            }
+
+            if (!conflict) break; // búsqueda de este dispositivo exitosa
         }
 
         if (conflict) {
-            last_device_flag = 1; // después de 3 reintentos fallidos, detenemos
+            // 3 reintentos agotados. El censo quedó INCOMPLETO: no es confiable.
+            // Se retorna un estado propio para que el llamador NO evicte esclavos
+            // reales que quedaron sin descubrir.
+            ESP_LOGW(TAG, "Escaneo truncado tras 3 reintentos (found=%d)", (int)*found);
+            return ESP_ERR_INVALID_STATE;
         } else {
             roms[*found] = rom;
             (*found)++;

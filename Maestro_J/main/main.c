@@ -1,4 +1,4 @@
-// IDJ Maestro v2 — Solo Jaulas (fix reconexión)
+// IDJ Maestro v3 — Solo Jaulas (fix descubrimiento bajo ruido / 1k pull-up)
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -28,10 +28,10 @@
 #define BUS_ERRORES_MAX      5
 #define CICLOS_EEPROM        10
 
-// FIX Bug 1: umbral más alto — 30 ciclos × 3s = 90s antes de evictar
+// Umbral de eviction — 30 ciclos × 3s = 90s antes de evictar
 #define AUSENCIAS_PRESENTE              3
 #define AUSENCIAS_EVICTAR              30
-// FIX Bug 1b: cuando el bus está vacío, incrementar ausencias más lento
+// Cuando el bus está vacío, incrementar ausencias más lento
 #define BUS_VACIO_CICLOS_INCREMENTO     3
 
 typedef struct {
@@ -142,7 +142,7 @@ void agregar_dispositivo(uint64_t rom) {
     num_dispositivos++;
 }
 
-// FIX Bug 3: lectura con hasta 3 reintentos y pausa entre ellos
+// Lectura de EEPROM con hasta 3 reintentos y pausa entre ellos
 bool leer_eeprom_dispositivo(ds2482_t *ds2482, size_t idx) {
     for (int intento = 0; intento < 3; intento++) {
         if (intento > 0) {
@@ -176,15 +176,28 @@ bool leer_eeprom_dispositivo(ds2482_t *ds2482, size_t idx) {
 void escanear_dispositivos(ds2482_t *ds2482, bool leer_eeprom) {
     uint64_t roms[MAX_DEVICES];
     size_t found = 0;
-    if (ds2482_search_rom_all(roms, MAX_DEVICES, &found) != ESP_OK) return;
+
+    esp_err_t e = ds2482_search_rom_all(roms, MAX_DEVICES, &found);
+    if (e == ESP_ERR_INVALID_STATE) {
+        // Escaneo truncado por ruido: censo NO confiable. Conservamos el estado
+        // previo y NO penalizamos ausencias este ciclo (evita evictar jaulas
+        // físicamente presentes que quedaron sin descubrir).
+        ESP_LOGW(TAG, "Escaneo truncado por ruido — se conserva estado previo");
+        return;
+    }
+    if (e != ESP_OK) return;
+
     ESP_LOGI(TAG, "ROMs en bus: %d | Leer EEPROM: %s",
              found, leer_eeprom ? "SI" : "no");
+
+    // Precomputar strings de ROM una sola vez (antes era O(n·m) dentro de Fase 2)
+    char roms_str[MAX_DEVICES][17];
+    for (size_t i = 0; i < found; i++) rom_to_string(roms[i], roms_str[i]);
 
     // Fase 1: agregar nuevos
     for (size_t i = 0; i < found; i++) {
         if (!rom_es_ds2431(roms[i])) continue;
-        char rom_str[17]; rom_to_string(roms[i], rom_str);
-        if (!existe_dispositivo(rom_str)) {
+        if (!existe_dispositivo(roms_str[i])) {
             agregar_dispositivo(roms[i]);
             nvs_dirty = true;
         }
@@ -192,15 +205,18 @@ void escanear_dispositivos(ds2482_t *ds2482, bool leer_eeprom) {
 
     // Fase 2: presencia y EEPROM
     for (size_t j = 0; j < num_dispositivos; j++) {
+        // Alimentar el watchdog: con muchos esclavos y reintentos de EEPROM
+        // (hasta 3×500ms + 300ms c/u) este bucle puede acercarse al timeout.
+        esp_task_wdt_reset();
+
         bool encontrado = false;
         for (size_t i = 0; i < found; i++) {
-            char rom_str[17]; rom_to_string(roms[i], rom_str);
-            if (strcmp(dispositivos[j].rom_str, rom_str) == 0) {
+            if (strcmp(dispositivos[j].rom_str, roms_str[i]) == 0) {
                 encontrado = true; break;
             }
         }
         if (encontrado) {
-            // FIX Bug 2: log de reconexión y reset de ausencias ANTES de leer
+            // Log de reconexión y reset de ausencias ANTES de leer
             if (!dispositivos[j].presente)
                 ESP_LOGI(TAG, "Reconectado: %s (%s)",
                          dispositivos[j].rom_str,
@@ -219,7 +235,7 @@ void escanear_dispositivos(ds2482_t *ds2482, bool leer_eeprom) {
         }
     }
 
-    // Fase 3: evictar — FIX Bug 1: umbral de 30 ciclos
+    // Fase 3: evictar — umbral de 30 ciclos
     size_t j = 0;
     while (j < num_dispositivos) {
         if (dispositivos[j].ausencias >= AUSENCIAS_EVICTAR) {
@@ -313,7 +329,7 @@ void app_main(void) {
         errores_bus = 0;
 
         if (!presence) {
-            // FIX Bug 1b: incrementar ausencias más lento cuando bus vacío
+            // Incrementar ausencias más lento cuando bus vacío
             ciclos_bus_vacio++;
             if (ciclos_bus_vacio % BUS_VACIO_CICLOS_INCREMENTO == 0) {
                 for (size_t i = 0; i < num_dispositivos; i++) {

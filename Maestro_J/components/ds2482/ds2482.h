@@ -27,6 +27,10 @@ esp_err_t ds2482_1wire_triplet(uint8_t direction, uint8_t *status);
 esp_err_t ds2482_read_status(ds2482_t *dev, uint8_t *status);
 esp_err_t ds2482_search_rom_all(uint64_t *roms, size_t max_devices, size_t *found);
 
+// CRC-8 Dallas/Maxim sobre los 7 primeros bytes de una ROM 1-Wire.
+// Debe coincidir con el byte 7 (rom8[7]) para que la ROM sea válida.
+uint8_t ds2482_rom_crc8(const uint8_t *rom8);
+
 // Bits del registro de configuración del DS2482
 #define DS2482_CFG_APU  (1 << 0)  // Active Pullup — necesario para cables largos
 #define DS2482_CFG_SPU  (1 << 2)  // Strong Pullup
